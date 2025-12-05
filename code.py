@@ -263,43 +263,28 @@ def metrics_multiclass(
 
     Notes:
       - For AUC, we use one-vs-rest multi-class AUC (macro).
-      - sklearn requires 'labels' to be ordered; we therefore sort labels for AUC and
-        reorder y_proba columns accordingly.
-      - 'labels' passed here is assumed to match the current column order of y_proba.
+      - Requires y_proba columns correspond to 'labels' in the same order.
     """
-    labels_in = [l.upper() for l in labels]
+    labels_up = [l.upper() for l in labels]
 
     yt = pd.Series(y_true).map(_normalize_readmitted_value)
     yp = pd.Series(y_pred).map(_normalize_readmitted_value)
 
     res: Dict[str, Optional[float]] = {
-        "macro_f1": float(f1_score(yt, yp, labels=labels_in, average="macro")),
-        "weighted_f1": float(f1_score(yt, yp, labels=labels_in, average="weighted")),
+        "macro_f1": float(f1_score(yt, yp, labels=labels_up, average="macro")),
+        "weighted_f1": float(f1_score(yt, yp, labels=labels_up, average="weighted")),
         "balanced_accuracy": float(balanced_accuracy_score(yt, yp)),
         "ovr_auc_macro": None,
     }
 
     if y_proba is not None:
         y_proba = np.asarray(y_proba)
-        if y_proba.ndim != 2 or y_proba.shape[1] != len(labels_in):
+        if y_proba.ndim != 2 or y_proba.shape[1] != len(labels_up):
             raise ValueError(
-                f"y_proba must have shape [n_samples, {len(labels_in)}] matching labels order {labels_in}."
+                f"y_proba must have shape [n_samples, {len(labels_up)}] matching labels order {labels_up}."
             )
-
-        # sklearn demands an ordered 'labels' list -> sort labels and reorder columns accordingly
-        labels_sorted = sorted(labels_in)
-        col_idx = [labels_in.index(lbl) for lbl in labels_sorted]
-        y_proba_sorted = y_proba[:, col_idx]
-
         res["ovr_auc_macro"] = float(
-            roc_auc_score(
-                yt,
-                y_proba_sorted,
-                multi_class="ovr",
-                average="macro",
-                labels=labels_sorted,
-            )
+            roc_auc_score(yt, y_proba, multi_class="ovr", average="macro", labels=labels_up)
         )
 
     return res
-
