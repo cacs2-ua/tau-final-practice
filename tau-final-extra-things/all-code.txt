@@ -418,6 +418,40 @@ if __name__ == "__main__":
 
 
 
+# 2.1 Apply ID -> description mappings (recommended for interpretability)
+df = df_raw.copy()
+
+def apply_mapping(df: pd.DataFrame, id_col: str, new_col: str) -> pd.DataFrame:
+    if id_col not in df.columns or id_col not in id_maps:
+        return df
+    map_df = id_maps[id_col]
+    mapper = map_df.set_index(id_col)["description"]
+    mapper.index = mapper.index.astype("string")
+
+    keys = df[id_col].astype("string").str.strip()
+    df[new_col] = keys.map(mapper)  # unknown stays <NA>
+    return df
+
+df = apply_mapping(df, "admission_type_id", "admission_type")
+df = apply_mapping(df, "discharge_disposition_id", "discharge_disposition")
+df = apply_mapping(df, "admission_source_id", "admission_source")
+
+# Optionally drop the numeric ID columns to avoid duplicated information:
+df = df.drop(columns=[c for c in ["admission_type_id", "discharge_disposition_id", "admission_source_id"] if c in df.columns])
+
+# 2.2 Engineer targets (binary + optional multiclass)
+df = project_code.engineer_targets(
+    df,
+    source_col="readmitted",
+    binary_col="readmitted_30d",
+    multiclass_col="readmitted_3class",
+    add_multiclass=True,
+    drop_source=False,
+    unknown_policy="error",  # fail fast if something unexpected appears
+)
+
+# Quick sanity check
+df[["readmitted", "readmitted_30d", "readmitted_3class"]].head(), df["readmitted"].value_counts()
 
 
 
@@ -430,7 +464,9 @@ if __name__ == "__main__":
 
 
 
----- SECTION3 ----
+
+
+---- SECTION 3 ----
 
 
 %%writefile section3_dataset_understanding.py
@@ -1078,6 +1114,14 @@ if __name__ == "__main__":
 
 
 
+import section3_dataset_understanding as s3
+
+# Build the report object (tables you can directly use in the PDF report)
+rep = s3.profile_dataset(df)
+
+# Display key tables
+rep.data_dictionary.head(20), rep.missing_summary.head(20)
+rep.leakage_risks, rep.quality_risks.head(30)
 
 
 
@@ -1608,6 +1652,53 @@ class TestSection4EDAImbalance(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
+
+
+import section4_eda_imbalance as s4
+
+# 4.1 Class imbalance (binary)
+imb = s4.compute_class_imbalance(df["readmitted_30d"].astype(int))
+imb.as_dict()
+
+
+
+
+# 4.2 Missingness by feature (using the unified missing-token logic)
+mf = s4.missingness_by_feature(df)
+mf.head(25)
+
+
+
+# 4.2 Missingness by row (how incomplete are records?)
+mr = s4.missingness_by_row(df, high_missing_threshold=0.30)
+mr.as_dict()
+
+
+
+
+# 4.3 Top-K category distributions for known high-cardinality columns
+for col in ["medical_specialty", "diag_1", "diag_2", "diag_3", "payer_code"]:
+    if col in df.columns:
+        top, nunique, coverage = s4.topk_table(df[col], k=15)
+        print(f"\n=== {col} | nunique={nunique} | top15 coverage={coverage:.3f} ===")
+        display(top)
+
+
+
+
+
+# 4.4 Dummy "most_frequent" baseline on a simple train/test split (illustrative only)
+excluded = {"readmitted", "readmitted_30d", "readmitted_3class"}
+feature_cols = [c for c in df.columns if c not in excluded]
+
+dummy_res = s4.run_dummy_most_frequent_baseline(
+    df,
+    feature_cols=feature_cols,
+    target_col="readmitted_30d",
+    test_size=0.2,
+    random_state=42,
+)
+dummy_res.as_dict()
 
 
 
@@ -2319,6 +2410,30 @@ class TestSection5PreprocessingPipeline(unittest.TestCase):
 
 
 
+import section5_preprocessing_pipeline as s5
+
+cfg = s5.DiabetesPreprocessConfig(
+    onehot_sparse=True,     # recommended for ~100k rows + many categoricals
+    rare_min_count=50,      # group very rare categories into __OTHER__
+)
+
+groups = s5.infer_feature_groups(df, cfg)
+groups
+
+
+
+
+
+
+pre = s5.build_preprocessor(df, cfg)
+
+X = df.drop(columns=[c for c in ["readmitted", "readmitted_30d", "readmitted_3class"] if c in df.columns])
+y = df["readmitted_30d"].astype(int)
+
+pre.fit(X, y)
+Xt = pre.transform(X)
+
+type(Xt), Xt.shape
 
 
 
@@ -2667,6 +2782,25 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 
 
+
+
+
+
+
+
+
+import section6_baseline_system as s6
+
+baseline_table = s6.run_dummy_baselines(
+    df,
+    target_col="readmitted_30d",
+    strategies=("most_frequent", "stratified"),
+    n_splits=10,
+    cv_random_state=42,
+    dummy_random_state=42,
+    preprocess_config=cfg,
+)
+baseline_table
 
 
 
@@ -3069,6 +3203,32 @@ if __name__ == "__main__":
 
 
 
+
+
+
+
+
+import section7_validation_protocol as s7
+
+y = df["readmitted_30d"].astype(int).to_numpy()
+
+splits = s7.make_stratified_cv_splits(
+    y,
+    n_splits=10,
+    shuffle=True,
+    random_state=42,   # keep fixed for reproducibility + Wilcoxon later
+)
+
+fingerprint = s7.cv_splits_fingerprint(splits)
+fingerprint
+
+
+
+
+
+
+
+
 ---- SECTION 8 ----
  
   
@@ -3433,3 +3593,22 @@ class TestSection8CoreModeling(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+
+
+
+import section8_core_modeling as s8
+
+out8 = s8.run_section8_core_models(
+    df,
+    target_col="readmitted_30d",
+    preprocess_config=cfg,
+    n_splits=10,
+    cv_random_state=42,
+    model_random_state=42,
+    cv_splits=splits,     # <<< critical: identical folds
+    return_oof=True,      # useful later for error analysis / XAI
+)
+
+out8.split_fingerprint, out8.summary_table
