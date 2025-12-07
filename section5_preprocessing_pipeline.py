@@ -177,10 +177,11 @@ class MissingTokenCleaner(BaseEstimator, TransformerMixin):
 
 
 class NumericCoercer(BaseEstimator, TransformerMixin):
-    """Coerce selected columns to numeric (float), invalid parsing -> NaN."""
+    """Coerce selected columns to numeric (float), invalid parsing -> NaN.
+    """
 
     def __init__(self, numeric_cols: Sequence[str]):
-        self.numeric_cols = list(numeric_cols)
+        self.numeric_cols = numeric_cols  # DO NOT copy/convert (clone compatibility)
 
     def fit(self, X, y=None):
         return self
@@ -193,7 +194,6 @@ class NumericCoercer(BaseEstimator, TransformerMixin):
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         return df
-
 
 class CategoricalCaster(BaseEstimator, TransformerMixin):
     """
