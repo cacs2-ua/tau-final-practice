@@ -1,18 +1,52 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from functools import lru_cache
+from typing import List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
 
-# Keep missing-token logic consistent with Sections 4/5
+# -------------------------
+# Missing token handling
+# -------------------------
 DEFAULT_MISSING_TOKENS: Tuple[str, ...] = (
     "", "?", "NA", "N/A", "NULL", "NAN", "UNKNOWN", "UNKNOWN/INVALID"
 )
 
-# Medication columns in the UCI diabetes dataset (we'll use intersection with df.columns for robustness)
+def _norm_token(x: object) -> str:
+    return str(x).strip().upper()
+
+_DEFAULT_MISSING_TOKENS_UP = frozenset(_norm_token(t) for t in DEFAULT_MISSING_TOKENS)
+
+@lru_cache(maxsize=64)
+def _missing_token_set(tokens: Tuple[str, ...]) -> frozenset[str]:
+    return frozenset(_norm_token(t) for t in tokens)
+
+def is_missing_token(x: object, *, missing_tokens: Sequence[str] = DEFAULT_MISSING_TOKENS) -> bool:
+    if x is None:
+        return True
+    try:
+        if pd.isna(x):
+            return True
+    except Exception:
+        pass
+
+    s = str(x)
+    if s.strip() == "":
+        return True
+
+    # Fast path for default tokens
+    up = _norm_token(s)
+    if missing_tokens is DEFAULT_MISSING_TOKENS:
+        return up in _DEFAULT_MISSING_TOKENS_UP
+
+    toks = _missing_token_set(tuple(missing_tokens))
+    return up in toks
+
+
+# Medication columns in the UCI diabetes dataset (intersection with df.columns for robustness)
 DEFAULT_MED_COLS: Tuple[str, ...] = (
     "metformin","repaglinide","nateglinide","chlorpropamide","glimepiride","acetohexamide",
     "glipizide","glyburide","tolbutamide","pioglitazone","rosiglitazone","acarbose","miglitol",
@@ -24,23 +58,15 @@ DEFAULT_MED_COLS: Tuple[str, ...] = (
 DIAG_COLS_DEFAULT: Tuple[str, ...] = ("diag_1", "diag_2", "diag_3")
 
 
-def _norm_token(x: object) -> str:
-    return str(x).strip().upper()
+# -------------------------
+# Helpers
+# -------------------------
+def _to_num(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce")
 
-
-def is_missing_token(x: object, *, missing_tokens: Sequence[str] = DEFAULT_MISSING_TOKENS) -> bool:
-    if x is None:
-        return True
-    try:
-        if pd.isna(x):
-            return True
-    except Exception:
-        pass
-    s = str(x)
-    if s.strip() == "":
-        return True
-    toks = {_norm_token(t) for t in missing_tokens}
-    return _norm_token(s) in toks
+def _df_elementwise_map(df: pd.DataFrame, func):
+    # pandas>=2.1: DataFrame.map exists; older: use applymap
+    return df.map(func) if hasattr(df, "map") else df.applymap(func)
 
 
 # -------------------------
@@ -54,12 +80,16 @@ def age_midpoint(age_str: object) -> float:
     if is_missing_token(age_str):
         return np.nan
     s = str(age_str).strip()
-    # Expect format "[a-b)"
-    if not (s.startswith("[") and "-" in s):
+    if not s:
         return np.nan
+
+    # Expect formats like "[a-b)" or "(a-b]" etc.
+    if "-" not in s:
+        return np.nan
+
     try:
         inside = s.strip("[]()")
-        a, b = inside.split("-")
+        a, b = inside.split("-", 1)
         a = float(a)
         b = float(b)
         return (a + b) / 2.0
@@ -83,14 +113,19 @@ def bin_numeric_fixed(
     Keeps reproducibility and avoids data-driven thresholds (leakage).
     """
     x_num = pd.to_numeric(x, errors="coerce")
-    return pd.cut(x_num, bins=bins, labels=labels, include_lowest=include_lowest, right=right)
+    return pd.cut(
+        x_num,
+        bins=bins,
+        labels=labels,
+        include_lowest=include_lowest,
+        right=right,
+        ordered=True,
+    )
 
 
 # -------------------------
 # ICD-9 grouping (high-level)
 # -------------------------
-_GENERIC_MISSING_TOKENS_UP = {"", "?", "NA", "N/A", "NULL", "NAN", "UNKNOWN", "UNKNOWN/INVALID"}
-
 def _diag_token(v: object) -> str | None:
     """Normalize and validate a diagnosis token."""
     if v is None:
@@ -100,13 +135,39 @@ def _diag_token(v: object) -> str | None:
             return None
     except Exception:
         pass
+
     s = str(v).strip()
     if s == "":
         return None
+
     up = s.upper()
-    if up in _GENERIC_MISSING_TOKENS_UP:
+    if up in _DEFAULT_MISSING_TOKENS_UP:
         return None
+
     return up
+
+def _extract_leading_numeric(tok: str) -> float | None:
+    """
+    Extract a leading numeric value from an ICD-9 token (handles '250.13', '401', '530.81').
+    Returns None if it can't parse a leading numeric prefix.
+    """
+    # Keep digits and first dot only until a non-digit/non-dot appears.
+    buf = []
+    dot_used = False
+    for ch in tok:
+        if ch.isdigit():
+            buf.append(ch)
+        elif ch == "." and not dot_used:
+            buf.append(ch)
+            dot_used = True
+        else:
+            break
+    if not buf:
+        return None
+    try:
+        return float("".join(buf))
+    except Exception:
+        return None
 
 def icd9_group(code: object) -> str:
     """
@@ -126,14 +187,15 @@ def icd9_group(code: object) -> str:
     if tok.startswith("E"):
         return "external_e"
 
-    # Numeric ICD-9 codes
-    try:
-        num = float(tok)
-    except Exception:
+    num = _extract_leading_numeric(tok)
+    if num is None:
         return "other"
 
+    # Special case diabetes: 250.xx
     if 250.0 <= num < 251.0:
         return "diabetes"
+
+    # Major ICD-9 chapters (coarse)
     if 1.0 <= num <= 139.0:
         return "infectious"
     if 140.0 <= num <= 239.0:
@@ -171,18 +233,32 @@ def icd9_group(code: object) -> str:
 
     return "other"
 
-
 def add_diag_group_features(df: pd.DataFrame, diag_cols: Sequence[str] = DIAG_COLS_DEFAULT) -> pd.DataFrame:
     out = df.copy()
     present = [c for c in diag_cols if c in out.columns]
     for c in present:
         out[f"{c}_group"] = out[c].map(icd9_group)
 
-    # small, useful aggregates
     group_cols = [f"{c}_group" for c in present]
     if group_cols:
+        # Counts / flags
         out["n_diabetes_diags"] = (out[group_cols] == "diabetes").sum(axis=1).astype(int)
-        out["primary_diag_is_diabetes"] = (out.get("diag_1_group", pd.Series(["unknown"] * len(out))) == "diabetes").astype(int)
+
+        # Robust primary flag (keeps index)
+        if "diag_1_group" in out.columns:
+            out["primary_diag_is_diabetes"] = (out["diag_1_group"] == "diabetes").astype(int)
+        else:
+            out["primary_diag_is_diabetes"] = pd.Series(0, index=out.index, dtype=int)
+
+        # Diversity of diagnosis groups (excluding missing)
+        tmp = out[group_cols].replace("__MISSING__", np.nan)
+        out["n_unique_diag_groups"] = tmp.nunique(axis=1, dropna=True).fillna(0).astype(int)
+
+        # Whether any diag group equals primary (useful redundancy indicator)
+        if "diag_1_group" in out.columns:
+            out["n_diags_same_as_primary_group"] = (
+                out[group_cols].eq(out["diag_1_group"], axis=0).sum(axis=1).astype(int)
+            )
 
     return out
 
@@ -190,21 +266,29 @@ def add_diag_group_features(df: pd.DataFrame, diag_cols: Sequence[str] = DIAG_CO
 # -------------------------
 # Labs & tests (A1C / glucose)
 # -------------------------
+_A1C_MAP = {"NONE": 0, "NORM": 1, ">7": 2, ">8": 3}
+_GLU_MAP = {"NONE": 0, "NORM": 1, ">200": 2, ">300": 3}
+
 def add_lab_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
     if "A1Cresult" in out.columns:
-        a1c = out["A1Cresult"].astype("object")
-        out["a1c_measured"] = (~a1c.map(is_missing_token) & (a1c.astype(str).str.strip().str.upper() != "NONE")).astype(int)
-        out["a1c_high"] = a1c.astype(str).str.strip().str.upper().isin({">7", ">8"}).astype(int)
+        a1c_raw = out["A1Cresult"].astype("object")
+        a1c_norm = a1c_raw.map(lambda v: "MISSING" if is_missing_token(v) else str(v).strip().upper())
+        out["a1c_measured"] = (a1c_norm.notna() & (a1c_norm != "MISSING") & (a1c_norm != "NONE")).astype(int)
+        out["a1c_high"] = a1c_norm.isin({">7", ">8"}).astype(int)
+        out["a1c_level"] = a1c_norm.map(_A1C_MAP).fillna(0).astype(int)
 
     if "max_glu_serum" in out.columns:
-        glu = out["max_glu_serum"].astype("object")
-        out["glu_measured"] = (~glu.map(is_missing_token) & (glu.astype(str).str.strip().str.upper() != "NONE")).astype(int)
-        out["glu_high"] = glu.astype(str).str.strip().str.upper().isin({">200", ">300"}).astype(int)
+        glu_raw = out["max_glu_serum"].astype("object")
+        glu_norm = glu_raw.map(lambda v: "MISSING" if is_missing_token(v) else str(v).strip().upper())
+        out["glu_measured"] = (glu_norm.notna() & (glu_norm != "MISSING") & (glu_norm != "NONE")).astype(int)
+        out["glu_high"] = glu_norm.isin({">200", ">300"}).astype(int)
+        out["glu_level"] = glu_norm.map(_GLU_MAP).fillna(0).astype(int)
 
     # Optional bins for lab procedure count (fixed thresholds)
     if "num_lab_procedures" in out.columns:
+        out["num_lab_procedures"] = _to_num(out["num_lab_procedures"])
         out["num_lab_procedures_bin"] = bin_numeric_fixed(
             out["num_lab_procedures"],
             bins=[-np.inf, 20, 40, 60, np.inf],
@@ -220,19 +304,25 @@ def add_lab_features(df: pd.DataFrame) -> pd.DataFrame:
 def add_utilization_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
-    # ensure numeric coercion for arithmetic
-    for c in ["number_outpatient", "number_emergency", "number_inpatient", "time_in_hospital", "num_medications", "number_diagnoses"]:
+    num_cols = [
+        "number_outpatient", "number_emergency", "number_inpatient",
+        "time_in_hospital", "num_medications", "number_diagnoses"
+    ]
+    for c in num_cols:
         if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
+            out[c] = _to_num(out[c])
 
     if all(c in out.columns for c in ["number_outpatient", "number_emergency", "number_inpatient"]):
-        out["total_visits"] = (out["number_outpatient"].fillna(0) +
-                              out["number_emergency"].fillna(0) +
-                              out["number_inpatient"].fillna(0)).astype(float)
+        out["total_visits"] = (
+            out["number_outpatient"].fillna(0)
+            + out["number_emergency"].fillna(0)
+            + out["number_inpatient"].fillna(0)
+        ).astype(float)
 
         out["any_emergency"] = (out["number_emergency"].fillna(0) > 0).astype(int)
         out["any_inpatient"] = (out["number_inpatient"].fillna(0) > 0).astype(int)
         out["any_outpatient"] = (out["number_outpatient"].fillna(0) > 0).astype(int)
+        out["any_prior_visit"] = (out["total_visits"].fillna(0) > 0).astype(int)
 
         out["total_visits_bin"] = bin_numeric_fixed(
             out["total_visits"],
@@ -265,9 +355,6 @@ def add_utilization_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _df_elementwise_map(df: pd.DataFrame, func):
-    return df.map(func) if hasattr(df, "map") else df.applymap(func)
-
 # -------------------------
 # Medication burden from per-drug columns
 # -------------------------
@@ -282,19 +369,23 @@ def add_medication_burden_features(
         return out
 
     meds = out[present].astype("object")
-
-    # Normalize
-    meds_norm = _df_elementwise_map(meds, lambda v: "MISSING" if is_missing_token(v) else str(v).strip().upper())
+    meds_norm = _df_elementwise_map(
+        meds, lambda v: "MISSING" if is_missing_token(v) else str(v).strip().upper()
+    )
 
     active_mask = meds_norm.isin({"STEADY", "UP", "DOWN"})
     changed_mask = meds_norm.isin({"UP", "DOWN"})
 
     out["n_active_diabetes_meds"] = active_mask.sum(axis=1).astype(int)
     out["n_changed_diabetes_meds"] = changed_mask.sum(axis=1).astype(int)
+    out["any_active_diabetes_med"] = (out["n_active_diabetes_meds"] > 0).astype(int)
+    out["any_changed_diabetes_med"] = (out["n_changed_diabetes_meds"] > 0).astype(int)
 
-    # insulin-specific flags (often predictive / clinically meaningful)
+    # insulin-specific flags
     if "insulin" in out.columns:
-        insulin = out["insulin"].astype("object").map(lambda v: "MISSING" if is_missing_token(v) else str(v).strip().upper())
+        insulin = out["insulin"].astype("object").map(
+            lambda v: "MISSING" if is_missing_token(v) else str(v).strip().upper()
+        )
         out["insulin_active"] = insulin.isin({"STEADY", "UP", "DOWN"}).astype(int)
         out["insulin_changed"] = insulin.isin({"UP", "DOWN"}).astype(int)
 
@@ -307,15 +398,15 @@ def add_medication_burden_features(
 def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
-    # age midpoint as numeric (enables non-linearities + interactions without exploding one-hot)
+    # age midpoint
     if "age" in out.columns:
         out["age_mid"] = out["age"].map(age_midpoint)
         out["elderly"] = (out["age_mid"].fillna(-1) >= 65).astype(int)
 
-    # interactions that often capture “burden × duration”
-    for c in ["time_in_hospital", "num_medications", "number_diagnoses"]:
+    # ensure numeric coercion for interactions
+    for c in ["time_in_hospital", "num_medications", "number_diagnoses", "total_visits"]:
         if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
+            out[c] = _to_num(out[c])
 
     if all(c in out.columns for c in ["time_in_hospital", "num_medications"]):
         out["stay_x_meds"] = (out["time_in_hospital"].fillna(0) * out["num_medications"].fillna(0)).astype(float)
@@ -324,8 +415,13 @@ def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
         out["stay_x_diagnoses"] = (out["time_in_hospital"].fillna(0) * out["number_diagnoses"].fillna(0)).astype(float)
 
     if all(c in out.columns for c in ["total_visits", "time_in_hospital"]):
-        out["visits_x_stay"] = (pd.to_numeric(out["total_visits"], errors="coerce").fillna(0) *
-                                out["time_in_hospital"].fillna(0)).astype(float)
+        out["visits_x_stay"] = (out["total_visits"].fillna(0) * out["time_in_hospital"].fillna(0)).astype(float)
+
+    if all(c in out.columns for c in ["age_mid", "num_medications"]):
+        out["age_x_meds"] = (out["age_mid"].fillna(0) * out["num_medications"].fillna(0)).astype(float)
+
+    if all(c in out.columns for c in ["age_mid", "total_visits"]):
+        out["age_x_visits"] = (out["age_mid"].fillna(0) * out["total_visits"].fillna(0)).astype(float)
 
     return out
 
@@ -353,6 +449,9 @@ def apply_feature_engineering(
     IMPORTANT: run this BEFORE building the Section 5 preprocessing pipeline,
     so the new columns are included in modeling.
     """
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("apply_feature_engineering expects a pandas DataFrame.")
+
     before = set(df.columns)
 
     out = df.copy()
