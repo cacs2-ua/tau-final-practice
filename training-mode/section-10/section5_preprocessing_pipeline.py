@@ -29,6 +29,7 @@ DEFAULT_MISSING_TOKENS: Tuple[str, ...] = (
     "?",
     "NA",
     "N/A",
+    "NONE",
     "NULL",
     "NAN",
     "UNKNOWN",

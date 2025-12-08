@@ -4040,3 +4040,1250 @@ class TestSection9ExpandedModeling(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
+
+
+
+
+
+---- SECTION 10 ----
+
+
+%%writefile section10_imbalance_handling.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Literal
+
+import numpy as np
+import pandas as pd
+
+from sklearn.base import clone
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.utils.class_weight import compute_sample_weight
+
+import section5_preprocessing_pipeline as s5
+import section7_validation_protocol as s7
+
+Split = s7.Split
+
+
+# ---------------------------------------------------------------------
+# Section 10 — Class Imbalance Handling Experiments
+#
+# Goals (rubric):
+# - Apply and compare ≥1 explicit imbalance method (we implement 4):
+#   (A) cost-sensitive learning via sample weights ("class_weight_balanced")
+#   (B) random oversampling ("random_over")
+#   (C) random undersampling ("random_under")
+#   (D) threshold moving to maximize F1 on training fold ("threshold_f1")
+#
+# Contract:
+# - SAME fixed CV splits (cv_splits) across all experiments (Section 7).
+# - NO leakage: resampling + threshold selection happen inside each fold using TRAIN only.
+# - Report ROC-AUC + precision/recall/F1 (minority class behavior), plus accuracy/balanced_accuracy.
+# ---------------------------------------------------------------------
+
+
+ImbalanceMethod = Literal[
+    "none",
+    "class_weight_balanced",
+    "random_over",
+    "random_under",
+    "threshold_f1",
+]
+
+
+@dataclass(frozen=True)
+class ImbalanceExperimentSpec:
+    model: str
+    method: ImbalanceMethod
+    # For sampling methods:
+    sampling_ratio: float = 1.0  # minority/majority after sampling (1.0 = balanced)
+    random_state: int = 42
+
+
+@dataclass(frozen=True)
+class Section10EvaluationResult:
+    spec: ImbalanceExperimentSpec
+    n_splits: int
+    split_fingerprint: str
+    fold_scores: Dict[str, np.ndarray]
+    mean_scores: Dict[str, float]
+    std_scores: Dict[str, float]
+    fold_thresholds: Optional[np.ndarray] = None  # only for threshold_f1
+
+    def as_row(self) -> Dict[str, Any]:
+        row: Dict[str, Any] = {
+            "model": self.spec.model,
+            "method": self.spec.method,
+            "sampling_ratio": float(self.spec.sampling_ratio),
+            "n_splits": int(self.n_splits),
+            "split_fingerprint": self.split_fingerprint,
+        }
+        if self.fold_thresholds is not None:
+            row["threshold_mean"] = float(np.mean(self.fold_thresholds))
+            row["threshold_std"] = float(np.std(self.fold_thresholds, ddof=1)) if len(self.fold_thresholds) > 1 else 0.0
+
+        for m, v in self.mean_scores.items():
+            row[f"{m}_mean"] = float(v)
+        for m, v in self.std_scores.items():
+            row[f"{m}_std"] = float(v)
+        return row
+
+
+# ------------------------------ helpers ------------------------------
+
+
+def _ensure_1d_binary(y: Iterable[int]) -> np.ndarray:
+    y_arr = np.asarray(list(y), dtype=int).ravel()
+    if y_arr.size == 0:
+        raise ValueError("y is empty.")
+    uniq = set(np.unique(y_arr).tolist())
+    if not uniq.issubset({0, 1}):
+        raise ValueError(f"Binary target must be in {{0,1}}. Found: {sorted(list(uniq))}")
+    return y_arr
+
+
+def _safe_index(X, idx: np.ndarray):
+    # Works for pandas, numpy, scipy sparse
+    if isinstance(X, (pd.DataFrame, pd.Series)):
+        return X.iloc[idx]
+    return X[idx]
+
+
+def _get_score_vector(estimator, X, *, positive_label: int = 1) -> np.ndarray:
+    """
+    Continuous scores for ROC-AUC + threshold moving:
+    - predict_proba[:, pos] if available
+    - else decision_function
+    """
+    if hasattr(estimator, "predict_proba"):
+        proba = estimator.predict_proba(X)
+        proba = np.asarray(proba)
+        if proba.ndim != 2 or proba.shape[1] < 2:
+            raise ValueError("predict_proba must return [n_samples, 2+] for binary tasks.")
+        # find column for positive_label if possible
+        classes = getattr(estimator, "classes_", None)
+        if classes is None:
+            pos_idx = 1
+        else:
+            classes = np.asarray(classes)
+            if positive_label in set(classes.tolist()):
+                pos_idx = int(np.where(classes == positive_label)[0][0])
+            else:
+                pos_idx = 1
+        return proba[:, pos_idx].astype(float)
+
+    if hasattr(estimator, "decision_function"):
+        s = estimator.decision_function(X)
+        return np.asarray(s, dtype=float).ravel()
+
+    raise ValueError("Estimator must provide predict_proba or decision_function for ROC-AUC/thresholding.")
+
+
+def _to_csc_if_sparse(X):
+    try:
+        from scipy import sparse
+    except Exception as e:
+        raise RuntimeError("scipy is required for sparse matrix operations. Install with: pip install scipy") from e
+    if sparse.issparse(X):
+        return X.tocsc()
+    return X
+
+
+def random_oversample(X, y: np.ndarray, *, ratio: float = 1.0, random_state: int = 42):
+    """
+    Randomly oversample the minority class with replacement to reach:
+        n_minority_new ~= ratio * n_majority
+    """
+    y = _ensure_1d_binary(y)
+    if not (ratio > 0.0):
+        raise ValueError("ratio must be > 0.")
+
+    rng = np.random.RandomState(int(random_state))
+    idx0 = np.where(y == 0)[0]
+    idx1 = np.where(y == 1)[0]
+    if len(idx0) == 0 or len(idx1) == 0:
+        return X, y
+
+    # identify minority/majority
+    if len(idx1) <= len(idx0):
+        idx_min, idx_maj = idx1, idx0
+        min_label = 1
+    else:
+        idx_min, idx_maj = idx0, idx1
+        min_label = 0
+
+    n_maj = len(idx_maj)
+    n_min = len(idx_min)
+    target_min = int(np.round(float(ratio) * n_maj))
+    if target_min <= n_min:
+        # already at/above target
+        new_idx = np.concatenate([idx_maj, idx_min])
+    else:
+        extra = rng.choice(idx_min, size=(target_min - n_min), replace=True)
+        new_idx = np.concatenate([idx_maj, idx_min, extra])
+
+    rng.shuffle(new_idx)
+    X_new = _safe_index(X, new_idx)
+    y_new = y[new_idx]
+    return X_new, y_new
+
+
+def random_undersample(X, y: np.ndarray, *, ratio: float = 1.0, random_state: int = 42):
+    """
+    Randomly undersample the majority class without replacement to reach:
+        n_majority_new ~= n_minority / ratio
+    where ratio = minority/majority after sampling (ratio=1 => balanced).
+    """
+    y = _ensure_1d_binary(y)
+    if not (ratio > 0.0):
+        raise ValueError("ratio must be > 0.")
+
+    rng = np.random.RandomState(int(random_state))
+    idx0 = np.where(y == 0)[0]
+    idx1 = np.where(y == 1)[0]
+    if len(idx0) == 0 or len(idx1) == 0:
+        return X, y
+
+    # identify minority/majority
+    if len(idx1) <= len(idx0):
+        idx_min, idx_maj = idx1, idx0
+    else:
+        idx_min, idx_maj = idx0, idx1
+
+    n_min = len(idx_min)
+    n_maj = len(idx_maj)
+
+    # want: n_min / n_maj_new ~= ratio  => n_maj_new ~= n_min / ratio
+    target_maj = int(np.round(float(n_min) / float(ratio)))
+    target_maj = max(1, min(target_maj, n_maj))
+
+    keep_maj = rng.choice(idx_maj, size=target_maj, replace=False)
+    new_idx = np.concatenate([idx_min, keep_maj])
+    rng.shuffle(new_idx)
+
+    X_new = _safe_index(X, new_idx)
+    y_new = y[new_idx]
+    return X_new, y_new
+
+
+def best_threshold_max_f1(
+    y_true: np.ndarray,
+    scores: np.ndarray,
+    *,
+    positive_label: int = 1,
+    n_grid: int = 200,
+) -> float:
+    """
+    Choose threshold that maximizes F1 on the provided (y_true, scores).
+    Uses quantile grid for stability and speed.
+    """
+    y_true = _ensure_1d_binary(y_true)
+    scores = np.asarray(scores, dtype=float).ravel()
+    if scores.size != y_true.size:
+        raise ValueError("scores and y_true must have the same length.")
+
+    # Build candidate thresholds
+    if scores.size <= 500:
+        candidates = np.unique(scores)
+    else:
+        qs = np.linspace(0.0, 1.0, int(n_grid))
+        candidates = np.unique(np.quantile(scores, qs))
+
+    best_t = float(candidates[0])
+    best_f1 = -1.0
+    best_recall = -1.0
+
+    for t in candidates:
+        y_pred = (scores >= t).astype(int)
+        f1 = float(f1_score(y_true, y_pred, pos_label=positive_label, zero_division=0))
+        if f1 > best_f1:
+            best_f1 = f1
+            best_t = float(t)
+            best_recall = float(recall_score(y_true, y_pred, pos_label=positive_label, zero_division=0))
+        elif f1 == best_f1:
+            # tie-break: prefer higher recall, then lower threshold (catch more positives)
+            rec = float(recall_score(y_true, y_pred, pos_label=positive_label, zero_division=0))
+            if rec > best_recall or (rec == best_recall and float(t) < best_t):
+                best_t = float(t)
+                best_recall = rec
+
+    return best_t
+
+
+def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_score: np.ndarray) -> Dict[str, float]:
+    return {
+        "roc_auc": float(roc_auc_score(y_true, y_score)),
+        "precision": float(precision_score(y_true, y_pred, pos_label=1, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, pos_label=1, zero_division=0)),
+        "f1": float(f1_score(y_true, y_pred, pos_label=1, zero_division=0)),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+    }
+
+
+def _supports_sample_weight(estimator) -> bool:
+    # Conservative check: many sklearn estimators accept it; this avoids hard failures.
+    import inspect
+    try:
+        sig = inspect.signature(estimator.fit)
+        return "sample_weight" in sig.parameters
+    except Exception:
+        return False
+
+
+# -------------------------- model factory ----------------------------
+
+
+def build_section10_estimator(model: str, *, random_state: int = 42, fast_mode: bool = False):
+    """
+    Minimal, rubric-safe set for Section 10:
+    - logistic_regression (probabilistic; classic for class weights + threshold moving)
+    - decision_tree (PDF notes sensitivity to imbalance)
+    - random_forest (ensemble/bagging; can respond well to imbalance methods)
+    """
+    model = str(model).strip().lower()
+    if model == "logistic_regression":
+        from sklearn.linear_model import LogisticRegression
+        return LogisticRegression(
+            solver="saga",
+            penalty="l2",
+            max_iter=2000,
+            random_state=int(random_state),
+            n_jobs=-1,
+        )
+
+    if model == "decision_tree":
+        from sklearn.tree import DecisionTreeClassifier
+        return DecisionTreeClassifier(random_state=int(random_state))
+
+    if model == "random_forest":
+        from sklearn.ensemble import RandomForestClassifier
+        n_estimators = 80 if fast_mode else 300
+        return RandomForestClassifier(
+            n_estimators=int(n_estimators),
+            random_state=int(random_state),
+            n_jobs=-1,
+        )
+
+    if model == "linear_svm":
+        from sklearn.svm import LinearSVC
+        return LinearSVC(C=1.0, random_state=int(random_state))
+
+    raise ValueError(f"Unknown model '{model}'. Use: logistic_regression, decision_tree, random_forest, linear_svm.")
+
+
+# ----------------------------- main CV -------------------------------
+
+
+def evaluate_section10_experiment_cv(
+    df: pd.DataFrame,
+    *,
+    target_col: str,
+    preprocess_config: Optional[s5.DiabetesPreprocessConfig],
+    cv_splits: Sequence[Split],
+    spec: ImbalanceExperimentSpec,
+    positive_label: int = 1,
+    fast_mode: bool = False,
+) -> Section10EvaluationResult:
+    """
+    Manual fold loop to guarantee:
+    - resampling inside TRAIN only
+    - threshold selection inside TRAIN only
+    - identical folds reused across all experiments
+    """
+    if preprocess_config is None:
+        preprocess_config = s5.DiabetesPreprocessConfig()
+
+    if target_col not in df.columns:
+        raise KeyError(f"Target column '{target_col}' not found in df.")
+
+    y = _ensure_1d_binary(df[target_col].astype(int).to_numpy())
+
+    drop_cols = [c for c in preprocess_config.target_cols if c in df.columns]
+    if target_col not in drop_cols:
+        drop_cols.append(target_col)
+    X = df.drop(columns=drop_cols, errors="ignore")
+    if X.shape[1] == 0:
+        raise ValueError("No feature columns available after dropping target columns.")
+
+    s7.validate_cv_splits(cv_splits, n_samples=len(y))
+    fp = s7.cv_splits_fingerprint(cv_splits)
+
+    # Preprocessor template (cloned each fold)
+    pre_template = s5.build_preprocessor(df, preprocess_config)
+
+    fold_metrics: Dict[str, List[float]] = {k: [] for k in ["roc_auc", "precision", "recall", "f1", "accuracy", "balanced_accuracy"]}
+    fold_thresholds: List[float] = []
+
+    for tr, te in cv_splits:
+        tr = np.asarray(tr, dtype=np.int64)
+        te = np.asarray(te, dtype=np.int64)
+
+        X_tr_raw = _safe_index(X, tr)
+        y_tr = y[tr]
+        X_te_raw = _safe_index(X, te)
+        y_te = y[te]
+
+        # Fit preprocessing on TRAIN only
+        pre = clone(pre_template)
+        pre.fit(X_tr_raw, y_tr)
+        X_tr = pre.transform(X_tr_raw)
+        X_te = pre.transform(X_te_raw)
+
+        # Apply imbalance method inside the fold (TRAIN only)
+        sample_weight = None
+        if spec.method == "class_weight_balanced":
+            sample_weight = compute_sample_weight(class_weight="balanced", y=y_tr).astype(float)
+
+        if spec.method == "random_over":
+            X_tr, y_tr = random_oversample(X_tr, y_tr, ratio=spec.sampling_ratio, random_state=spec.random_state)
+            sample_weight = None  # do not mix by default
+
+        if spec.method == "random_under":
+            X_tr, y_tr = random_undersample(X_tr, y_tr, ratio=spec.sampling_ratio, random_state=spec.random_state)
+            sample_weight = None
+
+        # Build estimator for this fold
+        est = build_section10_estimator(spec.model, random_state=spec.random_state, fast_mode=fast_mode)
+
+        # Some tree models prefer CSC if sparse
+        if spec.model in {"decision_tree", "random_forest"}:
+            X_tr_fit = _to_csc_if_sparse(X_tr)
+            X_te_fit = _to_csc_if_sparse(X_te)
+        else:
+            X_tr_fit, X_te_fit = X_tr, X_te
+
+        # Fit with or without sample_weight
+        if sample_weight is not None:
+            if not _supports_sample_weight(est):
+                raise RuntimeError(f"Estimator '{spec.model}' does not support sample_weight; cannot run class_weight_balanced.")
+            est.fit(X_tr_fit, y_tr, sample_weight=sample_weight)
+        else:
+            est.fit(X_tr_fit, y_tr)
+
+        # Scores for ROC-AUC and (optionally) threshold moving
+        tr_scores = _get_score_vector(est, X_tr_fit, positive_label=positive_label)
+        te_scores = _get_score_vector(est, X_te_fit, positive_label=positive_label)
+
+        if spec.method == "threshold_f1":
+            thr = best_threshold_max_f1(y_tr, tr_scores, positive_label=positive_label)
+            fold_thresholds.append(float(thr))
+            y_pred = (te_scores >= thr).astype(int)
+        else:
+            # default classifier decision (usually 0.5 for proba models, 0 for margin-based)
+            y_pred = np.asarray(est.predict(X_te_fit), dtype=int)
+
+        m = _compute_metrics(y_te, y_pred, te_scores)
+        for k in fold_metrics.keys():
+            fold_metrics[k].append(float(m[k]))
+
+    fold_scores = {k: np.asarray(v, dtype=float) for k, v in fold_metrics.items()}
+    mean_scores = {k: float(np.mean(v)) for k, v in fold_scores.items()}
+    std_scores = {k: float(np.std(v, ddof=1)) if len(v) > 1 else 0.0 for k, v in fold_scores.items()}
+
+    thr_arr = np.asarray(fold_thresholds, dtype=float) if spec.method == "threshold_f1" else None
+
+    return Section10EvaluationResult(
+        spec=spec,
+        n_splits=len(cv_splits),
+        split_fingerprint=fp,
+        fold_scores=fold_scores,
+        mean_scores=mean_scores,
+        std_scores=std_scores,
+        fold_thresholds=thr_arr,
+    )
+
+
+def run_section10_imbalance_experiments(
+    df: pd.DataFrame,
+    *,
+    target_col: str = "readmitted_30d",
+    preprocess_config: Optional[s5.DiabetesPreprocessConfig] = None,
+    cv_splits: Sequence[Split],
+    models: Sequence[str] = ("logistic_regression", "decision_tree", "random_forest"),
+    methods: Sequence[ImbalanceMethod] = ("none", "class_weight_balanced", "random_over", "random_under", "threshold_f1"),
+    sampling_ratio: float = 1.0,
+    random_state: int = 42,
+    fast_mode: bool = False,
+) -> Tuple[pd.DataFrame, Dict[Tuple[str, str], Section10EvaluationResult]]:
+    """
+    Returns:
+      - results_table: mean ± std per (model, method) for ROC-AUC + precision/recall/F1 (+ accuracy, balanced_accuracy)
+      - results_map: raw per-fold vectors (needed later for Wilcoxon / deeper analysis)
+    """
+    if preprocess_config is None:
+        preprocess_config = s5.DiabetesPreprocessConfig()
+
+    rows: List[Dict[str, Any]] = []
+    results_map: Dict[Tuple[str, str], Section10EvaluationResult] = {}
+
+    for model in models:
+        for method in methods:
+            spec = ImbalanceExperimentSpec(
+                model=str(model),
+                method=method,
+                sampling_ratio=float(sampling_ratio),
+                random_state=int(random_state),
+            )
+            res = evaluate_section10_experiment_cv(
+                df,
+                target_col=target_col,
+                preprocess_config=preprocess_config,
+                cv_splits=cv_splits,
+                spec=spec,
+                fast_mode=fast_mode,
+            )
+            rows.append(res.as_row())
+            results_map[(spec.model, spec.method)] = res
+
+    table = pd.DataFrame(rows)
+
+    # Nice, report-ready column ordering
+    metric_order = ["roc_auc", "precision", "recall", "f1", "accuracy", "balanced_accuracy"]
+    cols = (
+        ["model", "method", "sampling_ratio", "n_splits", "split_fingerprint"]
+        + (["threshold_mean", "threshold_std"] if "threshold_mean" in table.columns else [])
+        + [f"{m}_mean" for m in metric_order]
+        + [f"{m}_std" for m in metric_order]
+    )
+    cols = [c for c in cols if c in table.columns] + [c for c in table.columns if c not in cols]
+    table = table[cols].sort_values(["model", "method"]).reset_index(drop=True)
+
+    return table, results_map
+
+
+
+
+%%writefile test_section10_imbalance_handling.py
+
+import unittest
+import numpy as np
+import pandas as pd
+
+import section5_preprocessing_pipeline as s5
+import section7_validation_protocol as s7
+import section10_imbalance_handling as s10
+
+
+class TestSection10ImbalanceHandling(unittest.TestCase):
+    def _toy_diabetes_like_df(self, n: int = 300) -> pd.DataFrame:
+        rng = np.random.RandomState(0)
+
+        # 20% positives, 80% negatives
+        y = np.array([0] * int(n * 0.8) + [1] * (n - int(n * 0.8)), dtype=int)
+        rng.shuffle(y)
+
+        ages = list(s5.AGE_ORDER)
+        df = pd.DataFrame(
+            {
+                "encounter_id": np.arange(n),
+                "patient_nbr": np.arange(10_000, 10_000 + n),
+                "race": rng.choice(["Caucasian", "AfricanAmerican", "Hispanic", "?"], size=n),
+                "gender": rng.choice(["Male", "Female"], size=n),
+                "age": rng.choice(ages + ["?"], size=n),
+                "weight": rng.choice(["?", "70", "80", "90", "Unknown/Invalid"], size=n),
+                "admission_type_id": rng.choice([1, 2, 6], size=n),
+                "discharge_disposition_id": rng.choice([1, 3, 25], size=n),
+                "admission_source_id": rng.choice([1, 7], size=n),
+                "time_in_hospital": rng.choice([1, 2, 3, 4, 5, 6, 7], size=n),
+                "payer_code": rng.choice(["MC", "MD", "?", "SP"], size=n),
+                "medical_specialty": rng.choice(
+                    ["Cardiology", "InternalMedicine", "?", "RareSpecA", "RareSpecB"], size=n
+                ),
+                "num_lab_procedures": rng.poisson(lam=40, size=n),
+                "num_procedures": rng.poisson(lam=1, size=n),
+                "num_medications": rng.poisson(lam=10, size=n),
+                "number_outpatient": rng.poisson(lam=1, size=n),
+                "number_emergency": rng.poisson(lam=0.2, size=n),
+                "number_inpatient": rng.poisson(lam=0.5, size=n),
+                "diag_1": rng.choice(["250.83", "276", "648", "8", "401"], size=n),
+                "diag_2": rng.choice(["?", "250.01", "403", "V27"], size=n),
+                "diag_3": rng.choice(["?", "7", "9", "6"], size=n),
+                "A1Cresult": rng.choice(["None", "Norm", ">7", ">8", "?"], size=n),
+                "insulin": rng.choice(["No", "Steady", "Up", "Down"], size=n),
+                "change": rng.choice(["Ch", "No"], size=n),
+                "diabetesMed": rng.choice(["Yes", "No"], size=n),
+                "readmitted_30d": y,
+            }
+        )
+        return df
+
+    def test_random_over_and_under_sampling_balance_counts(self):
+        X = np.arange(20).reshape(-1, 1)
+        y = np.array([0] * 16 + [1] * 4, dtype=int)  # minority=1
+
+        Xo, yo = s10.random_oversample(X, y, ratio=1.0, random_state=0)
+        c0, c1 = int((yo == 0).sum()), int((yo == 1).sum())
+        self.assertEqual(c0, c1)
+
+        Xu, yu = s10.random_undersample(X, y, ratio=1.0, random_state=0)
+        c0u, c1u = int((yu == 0).sum()), int((yu == 1).sum())
+        self.assertEqual(c0u, c1u)
+
+    def test_best_threshold_max_f1_matches_bruteforce_on_small_case(self):
+        y = np.array([0, 0, 1, 1], dtype=int)
+        scores = np.array([0.1, 0.4, 0.35, 0.8], dtype=float)
+
+        thr = s10.best_threshold_max_f1(y, scores, n_grid=50)
+
+        # brute force over unique scores
+        best = None
+        best_f1 = -1
+        for t in np.unique(scores):
+            yp = (scores >= t).astype(int)
+            f1 = float(s10.f1_score(y, yp, pos_label=1, zero_division=0))  # sklearn metric via module import
+            if f1 > best_f1:
+                best_f1 = f1
+                best = float(t)
+
+        self.assertAlmostEqual(float(thr), float(best), places=12)
+
+    def test_run_section10_experiments_runs_and_returns_table(self):
+        df = self._toy_diabetes_like_df(n=260)
+        y = df["readmitted_30d"].astype(int).to_numpy()
+
+        splits = s7.make_stratified_cv_splits(y, n_splits=5, random_state=123)
+        cfg = s5.DiabetesPreprocessConfig(onehot_sparse=True, rare_min_count=1)
+
+        table, results_map = s10.run_section10_imbalance_experiments(
+            df,
+            target_col="readmitted_30d",
+            preprocess_config=cfg,
+            cv_splits=splits,
+            models=("logistic_regression", "decision_tree"),
+            methods=("none", "class_weight_balanced", "random_over", "threshold_f1"),
+            sampling_ratio=1.0,
+            random_state=42,
+            fast_mode=True,   # keep unit test fast
+        )
+
+        # 2 models * 4 methods = 8 rows
+        self.assertEqual(table.shape[0], 8)
+        self.assertIn("roc_auc_mean", table.columns)
+        self.assertIn("f1_mean", table.columns)
+        self.assertIn("recall_mean", table.columns)
+
+        # results_map contains per-fold vectors
+        self.assertEqual(len(results_map), 8)
+
+        for (model, method), res in results_map.items():
+            self.assertEqual(res.n_splits, 5)
+            self.assertEqual(len(res.fold_scores["roc_auc"]), 5)
+            self.assertTrue(np.isfinite(res.fold_scores["roc_auc"]).all())
+            # Means should be within [0,1] for these metrics
+            for m in ["roc_auc", "precision", "recall", "f1", "accuracy", "balanced_accuracy"]:
+                self.assertGreaterEqual(res.mean_scores[m], 0.0)
+                self.assertLessEqual(res.mean_scores[m], 1.0)
+
+            if method == "threshold_f1":
+                self.assertIsNotNone(res.fold_thresholds)
+                self.assertEqual(len(res.fold_thresholds), 5)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---- SECTION 11 ----
+
+
+%%writefile section11_feature_engineering.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+# Keep missing-token logic consistent with Sections 4/5
+DEFAULT_MISSING_TOKENS: Tuple[str, ...] = (
+    "", "?", "NA", "N/A", "NONE", "NULL", "NAN", "UNKNOWN", "UNKNOWN/INVALID"
+)
+
+# Medication columns in the UCI diabetes dataset (we'll use intersection with df.columns for robustness)
+DEFAULT_MED_COLS: Tuple[str, ...] = (
+    "metformin","repaglinide","nateglinide","chlorpropamide","glimepiride","acetohexamide",
+    "glipizide","glyburide","tolbutamide","pioglitazone","rosiglitazone","acarbose","miglitol",
+    "troglitazone","tolazamide","examide","citoglipton","insulin",
+    "glyburide-metformin","glipizide-metformin","glimepiride-pioglitazone",
+    "metformin-rosiglitazone","metformin-pioglitazone",
+)
+
+DIAG_COLS_DEFAULT: Tuple[str, ...] = ("diag_1", "diag_2", "diag_3")
+
+
+def _norm_token(x: object) -> str:
+    return str(x).strip().upper()
+
+
+def is_missing_token(x: object, *, missing_tokens: Sequence[str] = DEFAULT_MISSING_TOKENS) -> bool:
+    if x is None:
+        return True
+    try:
+        if pd.isna(x):
+            return True
+    except Exception:
+        pass
+    s = str(x)
+    if s.strip() == "":
+        return True
+    toks = {_norm_token(t) for t in missing_tokens}
+    return _norm_token(s) in toks
+
+
+# -------------------------
+# Age: interval -> midpoint
+# -------------------------
+def age_midpoint(age_str: object) -> float:
+    """
+    Convert age bucket like "[50-60)" -> 55.0.
+    Missing/unknown -> np.nan.
+    """
+    if is_missing_token(age_str):
+        return np.nan
+    s = str(age_str).strip()
+    # Expect format "[a-b)"
+    if not (s.startswith("[") and "-" in s):
+        return np.nan
+    try:
+        inside = s.strip("[]()")
+        a, b = inside.split("-")
+        a = float(a)
+        b = float(b)
+        return (a + b) / 2.0
+    except Exception:
+        return np.nan
+
+
+# -------------------------
+# Fixed binning (no leakage)
+# -------------------------
+def bin_numeric_fixed(
+    x: pd.Series,
+    bins: Sequence[float],
+    labels: Sequence[str],
+    *,
+    include_lowest: bool = True,
+    right: bool = True,
+) -> pd.Series:
+    """
+    Deterministic, fixed-threshold binning via pd.cut.
+    Keeps reproducibility and avoids data-driven thresholds (leakage).
+    """
+    x_num = pd.to_numeric(x, errors="coerce")
+    return pd.cut(x_num, bins=bins, labels=labels, include_lowest=include_lowest, right=right)
+
+
+# -------------------------
+# ICD-9 grouping (high-level)
+# -------------------------
+def _icd9_numeric_prefix(code: object) -> Optional[float]:
+    """
+    Parse ICD-9 code:
+      - '250.83' -> 250.83
+      - '276' -> 276.0
+      - 'V27'/'E849' -> None (handled as special)
+      - missing -> None
+    """
+    if is_missing_token(code):
+        return None
+    s = str(code).strip().upper()
+    if s.startswith(("V", "E")):
+        return None
+    # numeric part possibly with decimal
+    try:
+        return float(s)
+    except Exception:
+        # sometimes codes have trailing stuff; try leading numeric
+        num = ""
+        for ch in s:
+            if ch.isdigit() or ch == ".":
+                num += ch
+            else:
+                break
+        try:
+            return float(num) if num else None
+        except Exception:
+            return None
+
+
+def icd9_group(code: object) -> str:
+    """
+    High-level diagnosis grouping (compact categorical feature).
+    This is a common, clinically motivated way to reduce sparsity in diag_1/2/3.
+    """
+    if is_missing_token(code):
+        return "unknown"
+
+    s = str(code).strip().upper()
+    if s.startswith("V"):
+        return "supplementary"
+    if s.startswith("E"):
+        return "external_causes"
+
+    num = _icd9_numeric_prefix(s)
+    if num is None:
+        return "other"
+
+    # Diabetes specifically
+    if 250.0 <= num < 251.0:
+        return "diabetes"
+
+    # Broad ICD-9 chapters (approximate but standard in practice)
+    if 1.0 <= num < 140.0:
+        return "infectious"
+    if 140.0 <= num < 240.0:
+        return "neoplasms"
+    if 240.0 <= num < 280.0:
+        return "endocrine_metabolic"  # includes many metabolic disorders (excluding diabetes handled above)
+    if 280.0 <= num < 290.0:
+        return "blood"
+    if 290.0 <= num < 320.0:
+        return "mental"
+    if 320.0 <= num < 390.0:
+        return "nervous"
+    if 390.0 <= num < 460.0 or int(num) == 785:
+        return "circulatory"
+    if 460.0 <= num < 520.0 or int(num) == 786:
+        return "respiratory"
+    if 520.0 <= num < 580.0 or int(num) == 787:
+        return "digestive"
+    if 580.0 <= num < 630.0 or int(num) == 788:
+        return "genitourinary"
+    if 630.0 <= num < 680.0:
+        return "pregnancy"
+    if 680.0 <= num < 710.0:
+        return "skin"
+    if 710.0 <= num < 740.0:
+        return "musculoskeletal"
+    if 740.0 <= num < 800.0:
+        return "congenital_perinatal_other"
+    if 800.0 <= num < 1000.0:
+        return "injury_poisoning"
+
+    return "other"
+
+
+def add_diag_group_features(df: pd.DataFrame, diag_cols: Sequence[str] = DIAG_COLS_DEFAULT) -> pd.DataFrame:
+    out = df.copy()
+    present = [c for c in diag_cols if c in out.columns]
+    for c in present:
+        out[f"{c}_group"] = out[c].map(icd9_group)
+
+    # small, useful aggregates
+    group_cols = [f"{c}_group" for c in present]
+    if group_cols:
+        out["n_diabetes_diags"] = (out[group_cols] == "diabetes").sum(axis=1).astype(int)
+        out["primary_diag_is_diabetes"] = (out.get("diag_1_group", pd.Series(["unknown"] * len(out))) == "diabetes").astype(int)
+
+    return out
+
+
+# -------------------------
+# Labs & tests (A1C / glucose)
+# -------------------------
+def add_lab_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    if "A1Cresult" in out.columns:
+        a1c = out["A1Cresult"].astype("object")
+        out["a1c_measured"] = (~a1c.map(is_missing_token) & (a1c.astype(str).str.strip().str.upper() != "NONE")).astype(int)
+        out["a1c_high"] = a1c.astype(str).str.strip().str.upper().isin({">7", ">8"}).astype(int)
+
+    if "max_glu_serum" in out.columns:
+        glu = out["max_glu_serum"].astype("object")
+        out["glu_measured"] = (~glu.map(is_missing_token) & (glu.astype(str).str.strip().str.upper() != "NONE")).astype(int)
+        out["glu_high"] = glu.astype(str).str.strip().str.upper().isin({">200", ">300"}).astype(int)
+
+    # Optional bins for lab procedure count (fixed thresholds)
+    if "num_lab_procedures" in out.columns:
+        out["num_lab_procedures_bin"] = bin_numeric_fixed(
+            out["num_lab_procedures"],
+            bins=[-np.inf, 20, 40, 60, np.inf],
+            labels=["low", "medium", "high", "very_high"],
+        )
+
+    return out
+
+
+# -------------------------
+# Utilization / burden features
+# -------------------------
+def add_utilization_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    # ensure numeric coercion for arithmetic
+    for c in ["number_outpatient", "number_emergency", "number_inpatient", "time_in_hospital", "num_medications", "number_diagnoses"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    if all(c in out.columns for c in ["number_outpatient", "number_emergency", "number_inpatient"]):
+        out["total_visits"] = (out["number_outpatient"].fillna(0) +
+                              out["number_emergency"].fillna(0) +
+                              out["number_inpatient"].fillna(0)).astype(float)
+
+        out["any_emergency"] = (out["number_emergency"].fillna(0) > 0).astype(int)
+        out["any_inpatient"] = (out["number_inpatient"].fillna(0) > 0).astype(int)
+        out["any_outpatient"] = (out["number_outpatient"].fillna(0) > 0).astype(int)
+
+        out["total_visits_bin"] = bin_numeric_fixed(
+            out["total_visits"],
+            bins=[-np.inf, 0, 2, 5, np.inf],
+            labels=["none", "low", "medium", "high"],
+        )
+
+    if "time_in_hospital" in out.columns:
+        out["stay_bin"] = bin_numeric_fixed(
+            out["time_in_hospital"],
+            bins=[-np.inf, 3, 7, 14, np.inf],
+            labels=["short", "medium", "long", "very_long"],
+        )
+
+    if "num_medications" in out.columns:
+        out["num_medications_bin"] = bin_numeric_fixed(
+            out["num_medications"],
+            bins=[-np.inf, 5, 10, 20, np.inf],
+            labels=["low", "medium", "high", "very_high"],
+        )
+        out["polypharmacy"] = (out["num_medications"].fillna(0) >= 10).astype(int)
+
+    if "number_diagnoses" in out.columns:
+        out["number_diagnoses_bin"] = bin_numeric_fixed(
+            out["number_diagnoses"],
+            bins=[-np.inf, 3, 6, np.inf],
+            labels=["low", "medium", "high"],
+        )
+
+    return out
+
+
+# -------------------------
+# Medication burden from per-drug columns
+# -------------------------
+def add_medication_burden_features(
+    df: pd.DataFrame,
+    *,
+    med_cols: Sequence[str] = DEFAULT_MED_COLS,
+) -> pd.DataFrame:
+    out = df.copy()
+    present = [c for c in med_cols if c in out.columns]
+    if not present:
+        return out
+
+    meds = out[present].astype("object")
+
+    # Normalize
+    meds_norm = meds.applymap(lambda v: "MISSING" if is_missing_token(v) else str(v).strip().upper())
+
+    active_mask = meds_norm.isin({"STEADY", "UP", "DOWN"})
+    changed_mask = meds_norm.isin({"UP", "DOWN"})
+
+    out["n_active_diabetes_meds"] = active_mask.sum(axis=1).astype(int)
+    out["n_changed_diabetes_meds"] = changed_mask.sum(axis=1).astype(int)
+
+    # insulin-specific flags (often predictive / clinically meaningful)
+    if "insulin" in out.columns:
+        insulin = out["insulin"].astype("object").map(lambda v: "MISSING" if is_missing_token(v) else str(v).strip().upper())
+        out["insulin_active"] = insulin.isin({"STEADY", "UP", "DOWN"}).astype(int)
+        out["insulin_changed"] = insulin.isin({"UP", "DOWN"}).astype(int)
+
+    return out
+
+
+# -------------------------
+# Simple interactions (numeric only; low risk)
+# -------------------------
+def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    # age midpoint as numeric (enables non-linearities + interactions without exploding one-hot)
+    if "age" in out.columns:
+        out["age_mid"] = out["age"].map(age_midpoint)
+        out["elderly"] = (out["age_mid"].fillna(-1) >= 65).astype(int)
+
+    # interactions that often capture “burden × duration”
+    for c in ["time_in_hospital", "num_medications", "number_diagnoses"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    if all(c in out.columns for c in ["time_in_hospital", "num_medications"]):
+        out["stay_x_meds"] = (out["time_in_hospital"].fillna(0) * out["num_medications"].fillna(0)).astype(float)
+
+    if all(c in out.columns for c in ["time_in_hospital", "number_diagnoses"]):
+        out["stay_x_diagnoses"] = (out["time_in_hospital"].fillna(0) * out["number_diagnoses"].fillna(0)).astype(float)
+
+    if all(c in out.columns for c in ["total_visits", "time_in_hospital"]):
+        out["visits_x_stay"] = (pd.to_numeric(out["total_visits"], errors="coerce").fillna(0) *
+                                out["time_in_hospital"].fillna(0)).astype(float)
+
+    return out
+
+
+# -------------------------
+# Main entry point
+# -------------------------
+@dataclass(frozen=True)
+class FeatureEngineeringOutput:
+    df: pd.DataFrame
+    added_columns: List[str]
+
+
+def apply_feature_engineering(
+    df: pd.DataFrame,
+    *,
+    diag_cols: Sequence[str] = DIAG_COLS_DEFAULT,
+    med_cols: Sequence[str] = DEFAULT_MED_COLS,
+) -> FeatureEngineeringOutput:
+    """
+    Apply Section 11 transformations and return:
+      - df with engineered features added
+      - list of added column names (useful for report + debugging)
+
+    IMPORTANT: run this BEFORE building the Section 5 preprocessing pipeline,
+    so the new columns are included in modeling.
+    """
+    before = set(df.columns)
+
+    out = df.copy()
+    out = add_diag_group_features(out, diag_cols=diag_cols)
+    out = add_lab_features(out)
+    out = add_utilization_features(out)
+    out = add_medication_burden_features(out, med_cols=med_cols)
+    out = add_interaction_features(out)
+
+    after = set(out.columns)
+    added = sorted(list(after - before))
+    return FeatureEngineeringOutput(df=out, added_columns=added)
+
+
+%%writefile test_section11_feature_engineering.py
+
+import unittest
+import pandas as pd
+import numpy as np
+
+import section11_feature_engineering as s11
+
+
+class TestSection11FeatureEngineering(unittest.TestCase):
+    def _toy_df(self):
+        return pd.DataFrame(
+            {
+                "age": ["[30-40)", "[50-60)", "?", None],
+                "time_in_hospital": [1, 4, 7, 0],
+                "num_lab_procedures": [10, 20, 70, "?"],
+                "num_procedures": [0, 2, 1, 3],
+                "num_medications": [3, 8, 12, 5],
+                "number_outpatient": [0, 1, 0, 2],
+                "number_emergency": [0, 0, 2, 1],
+                "number_inpatient": [0, 2, 1, 0],
+                "number_diagnoses": [1, 3, 5, 2],
+                "diag_1": ["250.83", "401", "V27", "?"],
+                "diag_2": ["276", "403", "250.01", None],
+                "diag_3": ["8", "?", "E879", "250"],
+                "A1Cresult": ["None", "Norm", ">7", "?"],
+                "max_glu_serum": ["None", ">200", "Norm", ">300"],
+                "metformin": ["No", "Up", "Steady", None],
+                "insulin": ["No", "Steady", "Up", "Down"],
+            }
+        )
+
+    def test_icd9_grouping_basic(self):
+        self.assertEqual(s11.icd9_group("250.83"), "DIABETES")
+        self.assertEqual(s11.icd9_group("401"), "CIRCULATORY")
+        self.assertEqual(s11.icd9_group("V27"), "SUPPLEMENTARY_V")
+        self.assertEqual(s11.icd9_group("E879"), "EXTERNAL_E")
+        self.assertEqual(s11.icd9_group("?"), "__MISSING__")
+
+    def test_add_engineered_features_adds_expected_columns(self):
+        df = self._toy_df()
+        out = s11.add_engineered_features(df)
+
+        # Not in-place
+        self.assertNotEqual(id(df), id(out))
+
+        must_cols = [
+            "age_midpoint",
+            "time_in_hospital_log1p",
+            "number_inpatient_gt0",
+            "los_bin",
+            "polypharmacy_bin",
+            "labs_per_day",
+            "total_prior_utilization",
+            "diag_1_group",
+            "diag_2_group",
+            "diag_3_group",
+            "n_distinct_diag_groups",
+            "has_diabetes_diag",
+            "n_meds_up",
+            "n_meds_changed",
+            "any_insulin",
+            "A1C_measured",
+            "A1C_abnormal",
+            "glu_measured",
+            "glu_high",
+            "age_x_inpatient",
+            "los_x_meds",
+            "diagnoses_x_meds",
+            "diabetes_diag_x_insulin",
+        ]
+        for c in must_cols:
+            self.assertIn(c, out.columns)
+
+    def test_age_midpoint_values(self):
+        df = self._toy_df()
+        out = s11.add_engineered_features(df)
+
+        self.assertAlmostEqual(float(out.loc[0, "age_midpoint"]), 35.0)
+        self.assertAlmostEqual(float(out.loc[1, "age_midpoint"]), 55.0)
+        self.assertTrue(np.isnan(out.loc[2, "age_midpoint"]))
+        self.assertTrue(np.isnan(out.loc[3, "age_midpoint"]))
+
+    def test_bins(self):
+        df = self._toy_df()
+        out = s11.add_engineered_features(df)
+
+        self.assertEqual(out.loc[0, "los_bin"], "short_1_2")
+        self.assertEqual(out.loc[1, "los_bin"], "medium_3_5")
+        self.assertEqual(out.loc[2, "los_bin"], "long_6_plus")
+
+        self.assertEqual(out.loc[0, "polypharmacy_bin"], "low_0_5")
+        self.assertEqual(out.loc[1, "polypharmacy_bin"], "medium_6_10")
+        self.assertEqual(out.loc[2, "polypharmacy_bin"], "high_11_plus")
+
+    def test_rates(self):
+        df = self._toy_df()
+        out = s11.add_engineered_features(df)
+
+        # Row 0: labs_per_day = 10 / 1
+        self.assertAlmostEqual(float(out.loc[0, "labs_per_day"]), 10.0)
+        # Row 1: labs_per_day = 20 / 4 = 5
+        self.assertAlmostEqual(float(out.loc[1, "labs_per_day"]), 5.0)
+
+    def test_med_summaries(self):
+        df = self._toy_df()
+        out = s11.add_engineered_features(df)
+
+        # Row 1: metformin=Up -> n_meds_up at least 1
+        self.assertGreaterEqual(int(out.loc[1, "n_meds_up"]), 1)
+        # insulin Steady -> any_insulin = 1
+        self.assertEqual(int(out.loc[1, "any_insulin"]), 1)
+        # Row 0 insulin No -> any_insulin = 0
+        self.assertEqual(int(out.loc[0, "any_insulin"]), 0)
+
+    def test_lab_decomposition(self):
+        df = self._toy_df()
+        out = s11.add_engineered_features(df)
+
+        # A1C: None => not measured
+        self.assertEqual(int(out.loc[0, "A1C_measured"]), 0)
+        # A1C: Norm => measured but not abnormal
+        self.assertEqual(int(out.loc[1, "A1C_measured"]), 1)
+        self.assertEqual(int(out.loc[1, "A1C_abnormal"]), 0)
+        # A1C: >7 => abnormal
+        self.assertEqual(int(out.loc[2, "A1C_abnormal"]), 1)
+
+        # Glu: >200 => measured and high
+        self.assertEqual(int(out.loc[1, "glu_measured"]), 1)
+        self.assertEqual(int(out.loc[1, "glu_high"]), 1)
+
+    def test_diag_breadth_and_diabetes_flag(self):
+        df = self._toy_df()
+        out = s11.add_engineered_features(df)
+
+        # Row 0 has diag_1=DIABETES
+        self.assertEqual(int(out.loc[0, "has_diabetes_diag"]), 1)
+        # Row 1 diag_1=401 CIRC + diag_2=403 CIRC + diag_3 missing => breadth should be 1
+        self.assertEqual(int(out.loc[1, "n_distinct_diag_groups"]), 1)
+
+    def test_interactions(self):
+        df = self._toy_df()
+        out = s11.add_engineered_features(df)
+
+        # age_x_inpatient row 1: age_midpoint=55, inpatient=2 => 110
+        self.assertAlmostEqual(float(out.loc[1, "age_x_inpatient"]), 110.0)
+        # los_x_meds row 2: los=7, meds=12 => 84
+        self.assertAlmostEqual(float(out.loc[2, "los_x_meds"]), 84.0)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+
+    import os, importlib.util
+import pandas as pd
+
+# ---- Safe import of your local code.py (Section 2) ----
+def import_module_from_path(module_name: str, file_path: str):
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
+
+PROJECT_DIR = os.getcwd()  # notebook working dir
+project_code = import_module_from_path("project_code", os.path.join(PROJECT_DIR, "code.py"))
+
+# ---- Load real data ----
+df_raw = pd.read_csv("database/diabetic_data.csv")
+
+# ---- Add binary target (required by the practice) ----
+df = project_code.engineer_targets(
+    df_raw,
+    source_col="readmitted",
+    binary_col="readmitted_30d",
+    multiclass_col="readmitted_3class",
+    add_multiclass=True,
+    drop_source=False,
+    unknown_policy="error",
+)
+
+# ---- Section 11: feature engineering ----
+import section11_feature_engineering as s11
+
+fe_out = s11.apply_feature_engineering(df)
+df_fe = fe_out.df
+
+print("Added columns (Section 11):")
+print(fe_out.added_columns)
+
+# Quick sanity check: inspect some engineered fields
+cols_to_preview = [
+    "readmitted_30d",
+    "age", "age_mid", "elderly",
+    "diag_1", "diag_1_group",
+    "n_diabetes_diags", "primary_diag_is_diabetes",
+    "total_visits", "total_visits_bin",
+    "stay_bin", "num_medications_bin",
+    "n_active_diabetes_meds", "n_changed_diabetes_meds",
+    "a1c_measured", "a1c_high",
+    "glu_measured", "glu_high",
+    "stay_x_meds", "stay_x_diagnoses"
+]
+cols_to_preview = [c for c in cols_to_preview if c in df_fe.columns]
+df_fe[cols_to_preview].head(10)
+

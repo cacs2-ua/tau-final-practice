@@ -78,7 +78,7 @@ def compute_class_imbalance(
 # ---------------------------------------------------------------------
 
 MISSING_TOKENS: Tuple[str, ...] = (
-    "", "?", "NA", "N/A", "NULL", "NAN", "UNKNOWN", "UNKNOWN/INVALID"
+    "", "?", "NA", "N/A", "NONE", "NULL", "NAN", "UNKNOWN", "UNKNOWN/INVALID"
 )
 
 
