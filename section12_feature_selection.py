@@ -1,355 +1,421 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Literal
+from dataclasses import dataclass, replace
+from functools import partial
+from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-from sklearn.base import BaseEstimator, TransformerMixin, clone
-from sklearn.compose import ColumnTransformer
-from sklearn.feature_selection import SelectKBest, chi2, f_classif
+from sklearn.feature_selection import SelectFromModel, SelectKBest, RFE, chi2, mutual_info_classif
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
 
 import section5_preprocessing_pipeline as s5
 import section7_validation_protocol as s7
 
-Split = s7.Split
+
+SelectionMethod = Literal[
+    "filter_chi2",        # Filter family (fast, non-negative requirement)
+    "filter_mi",          # Filter family (can be slower)
+    "embedded_l1",        # Embedded family (L1 Logistic)
+    "wrapper_rfe_mi",     # Wrapper family (can be heavy; two-stage: MI -> RFE)
+]
 
 
-# ---------------------------------------------------------------------
-# 12.1  Helpers to introspect the Section 5 preprocessor
-# ---------------------------------------------------------------------
+# ------------------------- utilities -------------------------
 
-@dataclass(frozen=True)
-class PreprocessedFeatureInfo:
-    """
-    Description of features after applying the Section 5 ColumnTransformer.
-
-    It lets you:
-      - know how many features come from numeric / ordinal / categorical groups
-      - build a *second* transformer that does supervised selection on the
-        final numeric block (embedded / filter type).
-    """
-    n_num_features: int
-    n_ord_features: int
-    n_cat_features: int
-
-    num_slice: slice
-    ord_slice: slice
-    cat_slice: slice
-
-    total_dim: int
-
-
-def inspect_preprocessor_feature_slices(
-    df: pd.DataFrame,
-    config: Optional[s5.DiabetesPreprocessConfig] = None,
-) -> PreprocessedFeatureInfo:
-    """
-    Fit the Section 5 preprocessor on a tiny sample and recover the dimensionality
-    of each block (numeric / ordinal / categorical).
-
-    We don't need actual values, only how many columns each transformer produces.
-    """
-    if config is None:
-        config = s5.DiabetesPreprocessConfig()
-
-    pre = s5.build_preprocessor(df, config)
-    # Take a small subset just to fit (faster)
-    sample = df.head(200).copy()
-    X = sample.drop(columns=[c for c in config.target_cols if c in sample.columns], errors="ignore")
-    pre.fit(X)
-
-    # ColumnTransformer is the step "features" in the preprocessor pipeline
-    ct: ColumnTransformer = pre.named_steps["features"]
-
-    n_num = 0
-    n_ord = 0
-    n_cat = 0
-
-    # Order in ct.transformers_ defines the concatenation order
-    for name, trans, cols in ct.transformers_:
-        if name == "num":
-            # numeric pipeline: we can infer n_features by transforming a tiny batch
-            Z = trans.transform(X[cols].head(5))
-            n_num = Z.shape[1]
-        elif name == "ord":
-            Z = trans.transform(X[cols].head(5))
-            n_ord = Z.shape[1]
-        elif name == "cat":
-            Z = trans.transform(X[cols].head(5))
-            n_cat = Z.shape[1]
-
-    # Build slices
-    start = 0
-    num_slice = slice(start, start + n_num)
-    start += n_num
-    ord_slice = slice(start, start + n_ord)
-    start += n_ord
-    cat_slice = slice(start, start + n_cat)
-    total = start
-
-    return PreprocessedFeatureInfo(
-        n_num_features=int(n_num),
-        n_ord_features=int(n_ord),
-        n_cat_features=int(n_cat),
-        num_slice=num_slice,
-        ord_slice=ord_slice,
-        cat_slice=cat_slice,
-        total_dim=int(total),
-    )
-
-
-# ---------------------------------------------------------------------
-# 12.2  Supervised selector on the *numeric block* (filter + embedded)
-# ---------------------------------------------------------------------
-
-
-class NumericBlockSelector(BaseEstimator, TransformerMixin):
-    """
-    Transformer to keep only the numeric block inside the feature space.
-    It assumes the input is the output of the Section 5 ColumnTransformer.
-
-    We will use it ONLY inside a Pipeline, *after* the preprocessor.
-    """
-
-    def __init__(self, num_slice: slice):
-        self.num_slice = num_slice
-
-    def fit(self, X, y=None):
-        return self
-
-    def transform(self, X):
-        # X can be numpy array or sparse matrix
-        return X[:, self.num_slice]
-
-
-def _make_kbest_chi2_selector(k: int) -> SelectKBest:
-    # Chi-square requires non-negative features; Section 5 numeric block is scaled
-    # via MinMax/StandardScaler => typically OK. If some values end slightly
-    # negative (e.g., StandardScaler), you can switch to f_classif.
-    return SelectKBest(score_func=f_classif, k=k)
-
-
-# ---------------------------------------------------------------------
-# 12.3  Pipeline builders: full-features vs selected-features
-# ---------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class FeatureSelectionConfig:
-    """
-    Config for Section 12 experiments.
-
-    selector_type:
-      - "none": baseline all-features model
-      - "filter_numeric_kbest": ANOVA F-test on numeric block
-      - (extensible later: "embedded_l1", etc.)
-    """
-    selector_type: Literal["none", "filter_numeric_kbest"] = "none"
-    k_numeric: int = 10          # how many numeric features to keep
-    model_random_state: int = 42
-
-
-def build_logistic_pipeline_with_selection(
-    df: pd.DataFrame,
-    *,
-    preprocess_config: Optional[s5.DiabetesPreprocessConfig] = None,
-    fs_config: Optional[FeatureSelectionConfig] = None,
-) -> Pipeline:
-    """
-    Build a pipeline:
-
-        [preprocess] -> [optional numeric selection] -> [LogisticRegression]
-
-    The logistic model is the same family as in Sections 8–9, but here we
-    focus on feature selection.
-    """
-    if preprocess_config is None:
-        preprocess_config = s5.DiabetesPreprocessConfig()
-    if fs_config is None:
-        fs_config = FeatureSelectionConfig(selector_type="none")
-
-    pre = s5.build_preprocessor(df, preprocess_config)
-
-    # Base classifier
-    clf = LogisticRegression(
-        solver="saga",
-        penalty="l2",
-        max_iter=2000,
-        random_state=fs_config.model_random_state,
-        n_jobs=-1,
-    )
-
-    steps: List[Tuple[str, Any]] = [("pre", pre)]
-
-    if fs_config.selector_type == "none":
-        steps.append(("clf", clf))
-        return Pipeline(steps=steps)
-
-    # For selector_type != "none" we introspect the preprocessor to know
-    # the numeric slice, then add:
-    #   - NumericBlockSelector
-    #   - SelectKBest on that numeric block
-    # and *concatenate* with the rest via a small ColumnTransformer-like trick.
-    info = inspect_preprocessor_feature_slices(df, preprocess_config)
-
-    if fs_config.selector_type == "filter_numeric_kbest":
-        # After preprocessing we have: [num | ord | cat]
-        # We build a small "post-selection" transformer that:
-        #   1) splits X into [num, ord+cat]
-        #   2) applies SelectKBest to num
-        #   3) concatenates [num_selected, ord+cat] again
-
-        from sklearn.pipeline import FeatureUnion
-        from sklearn.preprocessing import FunctionTransformer
-
-        num_sel = Pipeline(
-            steps=[
-                ("slice_num", FunctionTransformer(lambda X: X[:, info.num_slice], accept_sparse=True)),
-                ("kbest", _make_kbest_chi2_selector(k=fs_config.k_numeric)),
-            ]
-        )
-
-        rest = FunctionTransformer(
-            lambda X: X[:, slice(info.num_slice.stop, info.total_dim)],
-            accept_sparse=True,
-        )
-
-        # FeatureUnion concatenates along feature axis:
-        union = FeatureUnion(
-            transformer_list=[
-                ("num_sel", num_sel),
-                ("rest", rest),
-            ]
-        )
-
-        steps.append(("select", union))
-        steps.append(("clf", clf))
-        return Pipeline(steps=steps)
-
-    raise ValueError(f"Unknown selector_type: {fs_config.selector_type}")
-
-
-# ---------------------------------------------------------------------
-# 12.4  End-to-end CV comparison: all-features vs selected-features
-# ---------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Section12RunResult:
-    target_col: str
-    n_splits: int
-    cv_random_state: int
-    split_fingerprint: str
-    configs: Dict[str, FeatureSelectionConfig]
-    results_by_name: Dict[str, s7.CVEvaluationResult]
-    summary_table: pd.DataFrame
+def _ensure_binary_target(y: Iterable[int]) -> np.ndarray:
+    y_arr = np.asarray(list(y), dtype=int).ravel()
+    if y_arr.size == 0:
+        raise ValueError("Empty target.")
+    uniq = set(np.unique(y_arr).tolist())
+    if not uniq.issubset({0, 1}):
+        raise ValueError(f"Target must be binary in {{0,1}}. Found: {sorted(list(uniq))}")
+    return y_arr
 
 
 def _default_X_y(
     df: pd.DataFrame,
     *,
     target_col: str,
-    preprocess_config: s5.DiabetesPreprocessConfig,
+    cfg: s5.DiabetesPreprocessConfig,
 ) -> Tuple[pd.DataFrame, np.ndarray]:
     if target_col not in df.columns:
-        raise KeyError(f"Target column '{target_col}' not found.")
-    y = df[target_col].astype(int).to_numpy()
-    drop_cols = [c for c in preprocess_config.target_cols if c in df.columns]
+        raise KeyError(f"Target column '{target_col}' not found in df.")
+
+    y = _ensure_binary_target(df[target_col].astype(int).to_numpy())
+
+    drop_cols = [c for c in cfg.target_cols if c in df.columns]
     if target_col not in drop_cols:
         drop_cols.append(target_col)
+
     X = df.drop(columns=drop_cols, errors="ignore")
     if X.shape[1] == 0:
-        raise ValueError("No features left after dropping target columns.")
+        raise ValueError("No feature columns left after dropping target columns.")
     return X, y
+
+
+def _logreg_l2(*, random_state: int = 42) -> LogisticRegression:
+    return LogisticRegression(
+        solver="saga",
+        penalty="l2",
+        C=1.0,
+        max_iter=3000,
+        random_state=int(random_state),
+        n_jobs=-1,
+    )
+
+
+def _logreg_l1(*, C: float = 0.05, random_state: int = 42) -> LogisticRegression:
+    return LogisticRegression(
+        solver="saga",
+        penalty="l1",
+        C=float(C),
+        max_iter=4000,
+        random_state=int(random_state),
+        n_jobs=-1,
+    )
+
+
+def _nonneg_config(base: s5.DiabetesPreprocessConfig) -> s5.DiabetesPreprocessConfig:
+    """
+    Make preprocessing non-negative so chi2 works:
+    - disable scaling (StandardScaler can create negatives)
+    - remove ordinal encoding (age ordinal can create -1 for unknown); treat age as categorical one-hot instead
+    """
+    return replace(base, scale_numeric=False, ordinal_cols={})
+
+
+# ------------------------- feature names + grouping -------------------------
+
+def _feature_names_after_preprocessing(
+    pre_fitted: Pipeline,
+    df_for_groups: pd.DataFrame,
+    cfg: s5.DiabetesPreprocessConfig,
+) -> np.ndarray:
+    """
+    Robust extraction of feature names from our Section 5 preprocessor
+    WITHOUT requiring custom transformers to implement get_feature_names_out().
+    """
+    groups = s5.infer_feature_groups(df_for_groups, cfg)
+    ct = pre_fitted.named_steps["features"]
+
+    names: List[str] = []
+
+    # Must follow the same order used in section5.build_preprocessor(): num, ord, cat
+    if groups.numeric and "num" in ct.named_transformers_:
+        names.extend([f"num__{c}" for c in groups.numeric])
+
+    if groups.ordinal and "ord" in ct.named_transformers_ and ct.named_transformers_["ord"] != "drop":
+        names.extend([f"ord__{c}" for c in groups.ordinal])
+
+    if groups.categorical and "cat" in ct.named_transformers_:
+        cat_pipe = ct.named_transformers_["cat"]
+        onehot = cat_pipe.named_steps["onehot"]
+        ohe_names = onehot.get_feature_names_out(groups.categorical)
+        names.extend([f"cat__{n}" for n in ohe_names])
+
+    return np.asarray(names, dtype=object)
+
+
+def _base_column_from_feature_name(feature_name: str, base_cols: Sequence[str]) -> str:
+    """
+    Map expanded one-hot feature names back to original column names.
+    Works with names like:
+      - num__time_in_hospital
+      - ord__age
+      - cat__medical_specialty_Cardiology
+    """
+    s = str(feature_name)
+    if s.startswith("num__"):
+        return s[len("num__"):]
+    if s.startswith("ord__"):
+        return s[len("ord__"):]
+    if s.startswith("cat__"):
+        rest = s[len("cat__"):]
+        # match the longest base col first (to handle underscores inside col names)
+        for col in sorted(base_cols, key=len, reverse=True):
+            if rest == col or rest.startswith(col + "_"):
+                return col
+        # fallback: before first underscore
+        return rest.split("_", 1)[0]
+    return s
+
+
+def _build_interpretation_tables(
+    fitted_pipe: Pipeline,
+    df: pd.DataFrame,
+    cfg: s5.DiabetesPreprocessConfig,
+    *,
+    method: SelectionMethod,
+    top_n_features: int = 40,
+    top_n_groups: int = 25,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Fit is already done. Extract:
+      - top features (expanded)
+      - top groups (original columns)
+    """
+    pre = fitted_pipe.named_steps["pre"]
+    feature_names = _feature_names_after_preprocessing(pre, df, cfg)
+
+    # Build full support + importance aligned to *preprocessed* feature space
+    support = None
+    importance = None
+
+    if method in {"filter_chi2", "filter_mi", "embedded_l1"}:
+        sel = fitted_pipe.named_steps["select"]
+        support = sel.get_support() if hasattr(sel, "get_support") else None
+
+        if method in {"filter_chi2", "filter_mi"} and hasattr(sel, "scores_"):
+            importance = np.asarray(sel.scores_, dtype=float)
+        elif method == "embedded_l1":
+            est = getattr(sel, "estimator_", None)
+            if est is not None and hasattr(est, "coef_"):
+                importance = np.abs(np.asarray(est.coef_, dtype=float)).ravel()
+
+    elif method == "wrapper_rfe_mi":
+        # Two-stage: kbest then RFE
+        kb = fitted_pipe.named_steps["kbest"]
+        rfe = fitted_pipe.named_steps["select"]
+
+        kb_support = kb.get_support()
+        kb_idx = np.where(kb_support)[0]
+
+        rfe_support = rfe.get_support()
+        picked_in_kb = np.where(rfe_support)[0]
+        picked_idx = kb_idx[picked_in_kb]
+
+        support = np.zeros(len(feature_names), dtype=bool)
+        support[picked_idx] = True
+
+        # importance proxy from RFE ranking (smaller rank => more important)
+        imp_full = np.zeros(len(feature_names), dtype=float)
+        ranking = np.asarray(getattr(rfe, "ranking_", np.ones(len(kb_idx))), dtype=float)
+        imp_kb = 1.0 / np.maximum(1.0, ranking)
+        imp_full[kb_idx] = imp_kb
+        importance = imp_full
+
+    if support is None:
+        support = np.ones(len(feature_names), dtype=bool)
+    if importance is None:
+        importance = np.zeros(len(feature_names), dtype=float)
+
+    base_cols = list(s5.infer_feature_groups(df, cfg).numeric) \
+             + list(s5.infer_feature_groups(df, cfg).ordinal) \
+             + list(s5.infer_feature_groups(df, cfg).categorical)
+
+    base_col = [
+        _base_column_from_feature_name(fn, base_cols=base_cols) for fn in feature_names
+    ]
+
+    feat_df = pd.DataFrame(
+        {
+            "feature": feature_names,
+            "base_column": base_col,
+            "selected": support.astype(bool),
+            "importance": importance.astype(float),
+        }
+    )
+
+    # Sort: selected first, then importance
+    feat_df_sorted = feat_df.sort_values(
+        ["selected", "importance"],
+        ascending=[False, False],
+    )
+
+    top_features = feat_df_sorted.head(int(top_n_features)).reset_index(drop=True)
+
+    # Aggregate at original column level (good for the “hypothesis about selected groups”)
+    grp = (
+        feat_df.assign(importance_selected=feat_df["importance"] * feat_df["selected"].astype(int))
+        .groupby("base_column", as_index=False)
+        .agg(
+            n_selected=("selected", "sum"),
+            n_total=("selected", "size"),
+            importance_sum=("importance_selected", "sum"),
+        )
+    )
+    grp["selected_rate"] = grp["n_selected"] / grp["n_total"].replace(0, np.nan)
+    grp = grp.sort_values(["importance_sum", "n_selected", "selected_rate"], ascending=False)
+    top_groups = grp.head(int(top_n_groups)).reset_index(drop=True)
+
+    return {"top_features": top_features, "top_groups": top_groups, "all_features_table": feat_df}
+
+
+# ------------------------- pipeline builders -------------------------
+
+def build_selection_pipeline(
+    df: pd.DataFrame,
+    *,
+    method: SelectionMethod,
+    cfg: s5.DiabetesPreprocessConfig,
+    random_state: int = 42,
+    k_best: int = 800,
+    chi2_k: int = 800,
+    l1_C: float = 0.05,
+    l1_threshold: str = "median",
+    l1_max_features: Optional[int] = None,
+    wrapper_k_pre: int = 1200,
+    wrapper_n: int = 250,
+    wrapper_step: float = 0.2,
+) -> Tuple[Pipeline, s5.DiabetesPreprocessConfig]:
+    """
+    Returns (pipeline, cfg_used).
+    """
+    cfg_used = cfg
+    if method == "filter_chi2":
+        cfg_used = _nonneg_config(cfg_used)
+
+    pre = s5.build_preprocessor(df, cfg_used)
+    clf = _logreg_l2(random_state=random_state)
+
+    if method == "filter_chi2":
+        selector = SelectKBest(score_func=chi2, k=int(chi2_k))
+        pipe = Pipeline([("pre", pre), ("select", selector), ("clf", clf)])
+        return pipe, cfg_used
+
+    if method == "filter_mi":
+        mi = partial(mutual_info_classif, discrete_features="auto", random_state=int(random_state))
+        selector = SelectKBest(score_func=mi, k=int(k_best))
+        pipe = Pipeline([("pre", pre), ("select", selector), ("clf", clf)])
+        return pipe, cfg_used
+
+    if method == "embedded_l1":
+        base_est = _logreg_l1(C=l1_C, random_state=random_state)
+        selector = SelectFromModel(
+            estimator=base_est,
+            threshold=l1_threshold,   # "median" is a good default
+            max_features=l1_max_features,
+        )
+        pipe = Pipeline([("pre", pre), ("select", selector), ("clf", clf)])
+        return pipe, cfg_used
+
+    if method == "wrapper_rfe_mi":
+        # two-stage to keep RFE feasible:
+        mi = partial(mutual_info_classif, discrete_features="auto", random_state=int(random_state))
+        kbest = SelectKBest(score_func=mi, k=int(wrapper_k_pre))
+
+        rfe_est = _logreg_l2(random_state=random_state)
+        rfe = RFE(estimator=rfe_est, n_features_to_select=int(wrapper_n), step=float(wrapper_step))
+
+        pipe = Pipeline([("pre", pre), ("kbest", kbest), ("select", rfe), ("clf", clf)])
+        return pipe, cfg_used
+
+    raise ValueError(f"Unknown method: {method}")
+
+
+# ------------------------- public runner -------------------------
+
+@dataclass(frozen=True)
+class Section12Result:
+    split_fingerprint: str
+    summary_table: pd.DataFrame
+    interpretations: Dict[str, Dict[str, pd.DataFrame]]  # method -> tables
 
 
 def run_section12_feature_selection(
     df: pd.DataFrame,
     *,
     target_col: str = "readmitted_30d",
-    preprocess_config: Optional[s5.DiabetesPreprocessConfig] = None,
+    preprocess_config_base: Optional[s5.DiabetesPreprocessConfig] = None,
+    cv_splits: Optional[Sequence[s7.Split]] = None,
     n_splits: int = 10,
     cv_random_state: int = 42,
     model_random_state: int = 42,
-    metrics: Sequence[str] = ("roc_auc", "precision", "recall", "f1", "accuracy", "balanced_accuracy"),
-    k_numeric: int = 10,
-    cv_splits: Optional[Sequence[Split]] = None,
-) -> Section12RunResult:
+    methods: Sequence[SelectionMethod] = ("filter_chi2", "embedded_l1"),
+    # method hyperparams:
+    k_best: int = 800,
+    chi2_k: int = 800,
+    l1_C: float = 0.05,
+    l1_threshold: str = "median",
+    l1_max_features: Optional[int] = None,
+    wrapper_k_pre: int = 1200,
+    wrapper_n: int = 250,
+    wrapper_step: float = 0.2,
+    # interpretation tables:
+    build_interpretation: bool = True,
+    top_n_features: int = 40,
+    top_n_groups: int = 25,
+) -> Section12Result:
     """
-    Compare:
-      - logistic_full: logistic regression on all preprocessed features
-      - logistic_fs:   logistic regression with numeric filter selection (k best)
-
-    using the SAME StratifiedKFold splits as in previous sections.
+    Produces:
+      - CV comparison table: all-features vs selected-features (same splits)
+      - Interpretation tables to support your “hypothesis about selected groups”
     """
-    if preprocess_config is None:
-        preprocess_config = s5.DiabetesPreprocessConfig()
+    if preprocess_config_base is None:
+        preprocess_config_base = s5.DiabetesPreprocessConfig()
 
-    X, y = _default_X_y(df, target_col=target_col, preprocess_config=preprocess_config)
+    X_base, y = _default_X_y(df, target_col=target_col, cfg=preprocess_config_base)
 
     if cv_splits is None:
-        cv_splits = s7.make_stratified_cv_splits(y, n_splits=n_splits, random_state=cv_random_state)
+        cv_splits = s7.make_stratified_cv_splits(
+            y, n_splits=int(n_splits), shuffle=True, random_state=int(cv_random_state)
+        )
     else:
-        s7.validate_cv_splits(cv_splits, n_samples=len(y), n_splits_expected=n_splits)
+        s7.validate_cv_splits(cv_splits, n_samples=len(y), n_splits_expected=int(n_splits))
 
     fp = s7.cv_splits_fingerprint(cv_splits)
 
-    cfg_full = FeatureSelectionConfig(
-        selector_type="none",
-        k_numeric=k_numeric,
-        model_random_state=model_random_state,
-    )
-    cfg_fs = FeatureSelectionConfig(
-        selector_type="filter_numeric_kbest",
-        k_numeric=k_numeric,
-        model_random_state=model_random_state,
-    )
-    configs: Dict[str, FeatureSelectionConfig] = {
-        "logistic_full": cfg_full,
-        "logistic_fs": cfg_fs,
-    }
+    rows: List[Dict[str, Any]] = []
+    interpretations: Dict[str, Dict[str, pd.DataFrame]] = {}
 
-    results_by_name: Dict[str, s7.CVEvaluationResult] = {}
-    for name, cfg in configs.items():
-        pipe = build_logistic_pipeline_with_selection(
-            df,
-            preprocess_config=preprocess_config,
-            fs_config=cfg,
-        )
+    # Helper to evaluate a pipeline and write a row
+    def _eval_and_row(method_name: str, variant: str, pipe: Pipeline) -> s7.CVEvaluationResult:
         res = s7.evaluate_binary_pipeline_cv(
-            pipe,
-            X,
-            y,
+            pipe, X_base, y,
             cv_splits=cv_splits,
-            metrics=metrics,
+            metrics=("roc_auc", "precision", "recall", "f1", "accuracy", "balanced_accuracy"),
             return_oof=False,
         )
-        results_by_name[name] = res
-
-    # Build compact summary table
-    rows: List[Dict[str, Any]] = []
-    for name, cfg in configs.items():
-        r = results_by_name[name]
-        row: Dict[str, Any] = {"model": name, "selector_type": cfg.selector_type, "k_numeric": cfg.k_numeric}
-        for m in metrics:
-            row[f"{m}_mean"] = float(r.mean_scores[m])
-            row[f"{m}_std"] = float(r.std_scores[m])
+        row = {
+            "method": method_name,
+            "variant": variant,  # "all_features" or "selected"
+            "split_fingerprint": fp,
+        }
+        for m in res.mean_scores:
+            row[f"{m}_mean"] = float(res.mean_scores[m])
+            row[f"{m}_std"] = float(res.std_scores[m])
         rows.append(row)
+        return res
 
-    cols = ["model", "selector_type", "k_numeric"] + [f"{m}_{s}" for m in metrics for s in ("mean", "std")]
-    summary_table = pd.DataFrame(rows)[cols]
+    # Run per-method comparisons
+    for method in methods:
+        # build selected pipeline (+ cfg used)
+        sel_pipe, cfg_used = build_selection_pipeline(
+            df,
+            method=method,
+            cfg=preprocess_config_base,
+            random_state=model_random_state,
+            k_best=k_best,
+            chi2_k=chi2_k,
+            l1_C=l1_C,
+            l1_threshold=l1_threshold,
+            l1_max_features=l1_max_features,
+            wrapper_k_pre=wrapper_k_pre,
+            wrapper_n=wrapper_n,
+            wrapper_step=wrapper_step,
+        )
 
-    return Section12RunResult(
-        target_col=target_col,
-        n_splits=n_splits,
-        cv_random_state=cv_random_state,
-        split_fingerprint=fp,
-        configs=configs,
-        results_by_name=results_by_name,
-        summary_table=summary_table,
-    )
+        # build matching all-features pipeline (same cfg_used!)
+        pre_all = s5.build_preprocessor(df, cfg_used)
+        all_pipe = Pipeline([("pre", pre_all), ("clf", _logreg_l2(random_state=model_random_state))])
+
+        _eval_and_row(str(method), "all_features", all_pipe)
+        _eval_and_row(str(method), "selected", sel_pipe)
+
+        if build_interpretation:
+            # Fit selected pipeline ON FULL DATA for stable, report-friendly “most predictive variables”
+            fitted = Pipeline(sel_pipe.steps)  # clone-ish
+            fitted.fit(X_base, y)
+            tables = _build_interpretation_tables(
+                fitted, df, cfg_used,
+                method=method,
+                top_n_features=top_n_features,
+                top_n_groups=top_n_groups,
+            )
+            interpretations[str(method)] = tables
+
+    summary = pd.DataFrame(rows).sort_values(["method", "variant"]).reset_index(drop=True)
+    return Section12Result(split_fingerprint=fp, summary_table=summary, interpretations=interpretations)
