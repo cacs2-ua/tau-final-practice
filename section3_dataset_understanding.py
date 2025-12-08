@@ -8,7 +8,7 @@ import pandas as pd
 
 
 DEFAULT_MISSING_TOKENS: Tuple[str, ...] = (
-    "", "?", "NA", "N/A", "NONE", "NULL", "NAN", "UNKNOWN", "UNKNOWN/INVALID"
+    "", "?", "NA", "N/A", "NULL", "NAN", "UNKNOWN", "UNKNOWN/INVALID"
 )
 
 DEFAULT_ID_COLUMNS: Tuple[str, ...] = (

@@ -1,0 +1,85 @@
+Graduated student in Computer Engineering at the University of Alicante (June 2025). Actually studying a master degree in Artificial Intelligence.
+
+HARD SKILLS
+
+    HTML, CSS, JavaScript, Bootstrap
+
+    Spring Boot
+
+    AWS
+
+    PHP, MySQL, MongoDB, Docker, Docker Compose
+
+    Vue.js, Node.js, Laravel
+
+    Testing in Maven and PHP
+
+    Version control: Git and GitHub
+
+
+SOFT SKILLS
+
+    Thanks to the Scrum methodology, I discovered that I love working in a team.
+
+    Self-learning, developed from the need to look for sources and documentation beyond the materials provided by the university.
+
+    Strong communication skills thanks to presentations in different talks for the MaquinUA project and thanks to the CDUA (UA Debate Club), of which I have been a member for 3 years.
+
+
+LANGUAGES
+
+	Spanish: Native
+	English: B2
+
+HONORS & AWARDS
+
+    Bronze medal winner in the Spanish Mathematical Olympiad (OME) in 2019 and 2021.
+
+    Member of the winning team of the Gennera Entrepreneurship Program (2021).
+
+    Member of the winning team of the Premios Impulso (2024 edition).
+
+    Completed IBM’s “Qubit by Qubit” Quantum Computing course (2021).
+
+    Completed the WSS program (2022).
+
+EXPERIENCE
+
+    Full Stack Developer
+
+    Development of a Web Application to interact in a user-friendly way with the University of Alicante vending machines through an interactive map
+
+    Winning project of the Premios Impulso (2024) in the Digital Transformation category.
+
+    Used Vue.js for the front end.
+
+    Used Node.js and Docker Compose for the back end.
+
+    Responsive design adapted to most devices.
+
+    Used the Scrum methodology to achieve excellent teamwork.
+
+    Link to the deployed application:
+    https://jcerveto.github.io/taes/
+
+    Development of a Web Application (VitalSanity) that enables integration with AutoFirma for the management of centralized medical records
+
+    Application developed using the Spring Boot framework.
+
+    Used AWS.
+
+    Authentication with digital certificate.
+
+    URL of the deployed application:
+    https://www.vitalsanity.net:11443/vital-sanity
+
+
+CONTACT
+
+    Email: crissx0159sx@gmail.com
+
+    LinkedIn: www.linkedin.com/in/cristian-silvestre-36b089320
+
+    GitHub: https://github.com/cacs2-ua
+
+    Web Portfolio: criscsfullstack.es
