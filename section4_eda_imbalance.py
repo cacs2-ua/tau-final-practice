@@ -178,6 +178,9 @@ class MissingnessByRowResult:
             "high_missing_fraction": self.high_missing_fraction,
         }
 
+def _df_elementwise_map(df: pd.DataFrame, func):
+    return df.map(func) if hasattr(df, "map") else df.applymap(func)
+
 
 def missingness_by_row(
     df: pd.DataFrame,
@@ -214,8 +217,9 @@ def missingness_by_row(
     if not feature_cols:
         raise ValueError("No feature columns provided for missingness_by_row.")
 
-    miss_matrix = df[feature_cols].applymap(
-        lambda v: is_missing(v, missing_tokens=missing_tokens)
+    miss_matrix = _df_elementwise_map(
+        df[feature_cols],
+        lambda v: is_missing(v, missing_tokens=missing_tokens),
     )
     missing_per_row = miss_matrix.sum(axis=1)
     missing_rate_per_row = missing_per_row / float(len(feature_cols))

@@ -89,89 +89,85 @@ def bin_numeric_fixed(
 # -------------------------
 # ICD-9 grouping (high-level)
 # -------------------------
-def _icd9_numeric_prefix(code: object) -> Optional[float]:
-    """
-    Parse ICD-9 code:
-      - '250.83' -> 250.83
-      - '276' -> 276.0
-      - 'V27'/'E849' -> None (handled as special)
-      - missing -> None
-    """
-    if is_missing_token(code):
-        return None
-    s = str(code).strip().upper()
-    if s.startswith(("V", "E")):
-        return None
-    # numeric part possibly with decimal
-    try:
-        return float(s)
-    except Exception:
-        # sometimes codes have trailing stuff; try leading numeric
-        num = ""
-        for ch in s:
-            if ch.isdigit() or ch == ".":
-                num += ch
-            else:
-                break
-        try:
-            return float(num) if num else None
-        except Exception:
-            return None
+_GENERIC_MISSING_TOKENS_UP = {"", "?", "NA", "N/A", "NULL", "NAN", "UNKNOWN", "UNKNOWN/INVALID"}
 
+def _diag_token(v: object) -> str | None:
+    """Normalize and validate a diagnosis token."""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    s = str(v).strip()
+    if s == "":
+        return None
+    up = s.upper()
+    if up in _GENERIC_MISSING_TOKENS_UP:
+        return None
+    return up
 
 def icd9_group(code: object) -> str:
     """
-    High-level diagnosis grouping (compact categorical feature).
-    This is a common, clinically motivated way to reduce sparsity in diag_1/2/3.
+    Robust ICD-9 grouping:
+      - V* -> supplementary_v
+      - E* -> external_e
+      - numeric ranges -> major ICD-9 chapter
+      - 250.* -> diabetes (special case)
     """
-    if is_missing_token(code):
-        return "unknown"
+    tok = _diag_token(code)
+    if tok is None:
+        return "__MISSING__"
 
-    s = str(code).strip().upper()
-    if s.startswith("V"):
-        return "supplementary"
-    if s.startswith("E"):
-        return "external_causes"
+    # Non-numeric ICD-9 families
+    if tok.startswith("V"):
+        return "supplementary_v"
+    if tok.startswith("E"):
+        return "external_e"
 
-    num = _icd9_numeric_prefix(s)
-    if num is None:
+    # Numeric ICD-9 codes
+    try:
+        num = float(tok)
+    except Exception:
         return "other"
 
-    # Diabetes specifically
     if 250.0 <= num < 251.0:
         return "diabetes"
-
-    # Broad ICD-9 chapters (approximate but standard in practice)
-    if 1.0 <= num < 140.0:
+    if 1.0 <= num <= 139.0:
         return "infectious"
-    if 140.0 <= num < 240.0:
+    if 140.0 <= num <= 239.0:
         return "neoplasms"
-    if 240.0 <= num < 280.0:
-        return "endocrine_metabolic"  # includes many metabolic disorders (excluding diabetes handled above)
-    if 280.0 <= num < 290.0:
+    if 240.0 <= num <= 279.0:
+        return "endocrine_metabolic"
+    if 280.0 <= num <= 289.0:
         return "blood"
-    if 290.0 <= num < 320.0:
+    if 290.0 <= num <= 319.0:
         return "mental"
-    if 320.0 <= num < 390.0:
+    if 320.0 <= num <= 389.0:
         return "nervous"
-    if 390.0 <= num < 460.0 or int(num) == 785:
+    if 390.0 <= num <= 459.0:
         return "circulatory"
-    if 460.0 <= num < 520.0 or int(num) == 786:
+    if 460.0 <= num <= 519.0:
         return "respiratory"
-    if 520.0 <= num < 580.0 or int(num) == 787:
+    if 520.0 <= num <= 579.0:
         return "digestive"
-    if 580.0 <= num < 630.0 or int(num) == 788:
+    if 580.0 <= num <= 629.0:
         return "genitourinary"
-    if 630.0 <= num < 680.0:
+    if 630.0 <= num <= 679.0:
         return "pregnancy"
-    if 680.0 <= num < 710.0:
+    if 680.0 <= num <= 709.0:
         return "skin"
-    if 710.0 <= num < 740.0:
+    if 710.0 <= num <= 739.0:
         return "musculoskeletal"
-    if 740.0 <= num < 800.0:
-        return "congenital_perinatal_other"
-    if 800.0 <= num < 1000.0:
-        return "injury_poisoning"
+    if 740.0 <= num <= 759.0:
+        return "congenital"
+    if 760.0 <= num <= 779.0:
+        return "perinatal"
+    if 780.0 <= num <= 799.0:
+        return "symptoms"
+    if 800.0 <= num <= 999.0:
+        return "injury"
 
     return "other"
 
@@ -269,6 +265,9 @@ def add_utilization_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _df_elementwise_map(df: pd.DataFrame, func):
+    return df.map(func) if hasattr(df, "map") else df.applymap(func)
+
 # -------------------------
 # Medication burden from per-drug columns
 # -------------------------
@@ -285,7 +284,7 @@ def add_medication_burden_features(
     meds = out[present].astype("object")
 
     # Normalize
-    meds_norm = meds.applymap(lambda v: "MISSING" if is_missing_token(v) else str(v).strip().upper())
+    meds_norm = _df_elementwise_map(meds, lambda v: "MISSING" if is_missing_token(v) else str(v).strip().upper())
 
     active_mask = meds_norm.isin({"STEADY", "UP", "DOWN"})
     changed_mask = meds_norm.isin({"UP", "DOWN"})
