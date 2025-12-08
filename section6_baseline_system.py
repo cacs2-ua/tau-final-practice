@@ -80,7 +80,6 @@ def _scorers_binary() -> Dict[str, object]:
         "f1": make_scorer(f1_score, zero_division=0),
     }
 
-
 def evaluate_dummy_baseline_cv(
     df: pd.DataFrame,
     *,
@@ -90,32 +89,14 @@ def evaluate_dummy_baseline_cv(
     cv_random_state: int = 42,
     dummy_random_state: int = 42,
     preprocess_config: Optional[s5.DiabetesPreprocessConfig] = None,
+    cv_splits: Optional[Sequence[Tuple[np.ndarray, np.ndarray]]] = None,
 ) -> BaselineCVResult:
     """
     Evaluate a DummyClassifier baseline under Stratified K-Fold CV.
 
-    Parameters
-    ----------
-    df:
-        DataFrame containing features + a binary target column.
-    target_col:
-        Name of the binary target (1 = readmitted <30 days, 0 = otherwise).
-    strategy:
-        DummyClassifier strategy, e.g. "most_frequent" or "stratified".
-    n_splits:
-        Number of CV folds (10 required later; baseline can already match it).
-    cv_random_state:
-        Seed for fold generation (must be fixed for reproducibility).
-    dummy_random_state:
-        Seed for DummyClassifier randomness (relevant for "stratified"/"uniform").
-    preprocess_config:
-        If provided, used to build the exact same preprocessing pipeline as later models.
-
-    Returns
-    -------
-    BaselineCVResult:
-        Per-fold scores + mean/std for:
-        roc_auc, accuracy, precision, recall, f1
+    NEW (Section 7 requirement):
+      - If cv_splits is provided, those exact folds are used (identical partitions across experiments).
+      - Otherwise, a StratifiedKFold is created as before.
     """
     if preprocess_config is None:
         preprocess_config = s5.DiabetesPreprocessConfig()
@@ -126,21 +107,25 @@ def evaluate_dummy_baseline_cv(
     y = _validate_binary_target(df[target_col])
     X = _default_feature_frame(df, target_col=target_col, config=preprocess_config)
 
-    # Build preprocessing “single source of truth” (Section 5),
-    # then attach the dummy baseline classifier.
     pre = s5.build_preprocessor(df, preprocess_config)
 
     clf = DummyClassifier(strategy=strategy, random_state=dummy_random_state)
     pipe = Pipeline(steps=[("pre", pre), ("dummy", clf)])
 
-    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=cv_random_state)
+    if cv_splits is not None:
+        cv_used = list(cv_splits)
+        n_splits_effective = len(cv_used)
+    else:
+        cv_used = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=cv_random_state)
+        n_splits_effective = n_splits
+
     scoring = _scorers_binary()
 
     out = cross_validate(
         pipe,
         X,
         y,
-        cv=cv,
+        cv=cv_used,
         scoring=scoring,
         return_train_score=False,
         n_jobs=None,
@@ -155,7 +140,7 @@ def evaluate_dummy_baseline_cv(
 
     return BaselineCVResult(
         strategy=strategy,
-        n_splits=n_splits,
+        n_splits=n_splits_effective,
         fold_scores=fold_scores,
         mean_scores=mean_scores,
         std_scores=std_scores,
@@ -171,10 +156,14 @@ def run_dummy_baselines(
     cv_random_state: int = 42,
     dummy_random_state: int = 42,
     preprocess_config: Optional[s5.DiabetesPreprocessConfig] = None,
+    cv_splits: Optional[Sequence[Tuple[np.ndarray, np.ndarray]]] = None,
 ) -> pd.DataFrame:
     """
     Convenience helper: evaluate multiple DummyClassifier baselines
     and return a compact results table (mean ± std across folds).
+
+    NEW:
+      - cv_splits can be passed to force identical folds across baselines and later models.
     """
     rows: List[Dict[str, float]] = []
     for strat in strategies:
@@ -186,11 +175,11 @@ def run_dummy_baselines(
             cv_random_state=cv_random_state,
             dummy_random_state=dummy_random_state,
             preprocess_config=preprocess_config,
+            cv_splits=cv_splits,
         )
         rows.append(res.as_row())
 
     table = pd.DataFrame(rows)
-    # Nice ordering for the report/table
     preferred = [
         "strategy",
         "n_splits",

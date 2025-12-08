@@ -1,0 +1,414 @@
+---- SECTION 2 ----
+ 
+(  readmitted  readmitted_30d readmitted_3class
+ 0         NO               0                NO
+ 1        >30               0               >30
+ 2         NO               0                NO
+ 3         NO               0                NO
+ 4         NO               0                NO,
+ readmitted
+ NO     54864
+ >30    35545
+ <30    11357
+ Name: count, dtype: Int64)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---- SECTION 3 ----
+
+
+(         column        risk_type severity  \
+ 0  encounter_id  identifier_like     high   
+ 1   patient_nbr  identifier_like     high   
+ 
+                                               reason  unique_ratio  n_unique  \
+ 0  Column name matches a known identifier field (...      1.000000    101766   
+ 1  Column name matches a known identifier field (...      0.702769     71518   
+ 
+    n_rows  
+ 0  101766  
+ 1  101766  ,
+          column                    risk_type severity        metric     value  \
+ 0   citoglipton  constant_or_almost_constant      low      n_unique  1.000000   
+ 1       examide  constant_or_almost_constant      low      n_unique  1.000000   
+ 2  encounter_id             high_cardinality      low  unique_ratio  1.000000   
+ 3   patient_nbr             high_cardinality      low  unique_ratio  0.702769   
+ 
+    threshold                                               note  
+ 0        1.0       Usually safe to drop (no predictive signal).  
+ 1        1.0       Usually safe to drop (no predictive signal).  
+ 2        0.5  May lead to sparse features / overfitting if o...  
+ 3        0.5  May lead to sparse features / overfitting if o...  )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---- SECTION 4 ----
+
+
+
+-- SECTION 4.1 --
+
+{'N': 101766,
+ 'n_pos': 11357,
+ 'n_neg': 90409,
+ 'pos_rate': 0.11159915885462728,
+ 'neg_rate': 0.8884008411453728}
+
+
+
+
+
+
+
+
+
+
+-- SECTION 4.2 --
+
+
+missing_rate	missing_count
+weight	0.968585	98569
+max_glu_serum	0.947468	96420
+A1Cresult	0.832773	84748
+medical_specialty	0.490822	49949
+payer_code	0.395574	40256
+admission_source	0.066633	6781
+admission_type	0.051992	5291
+discharge_disposition	0.036269	3691
+race	0.022336	2273
+diag_3	0.013983	1423
+diag_2	0.003518	358
+diag_1	0.000206	21
+gender	0.000029	3
+time_in_hospital	0.000000	0
+age	0.000000	0
+encounter_id	0.000000	0
+patient_nbr	0.000000	0
+number_emergency	0.000000	0
+number_inpatient	0.000000	0
+num_medications	0.000000	0
+number_outpatient	0.000000	0
+num_procedures	0.000000	0
+num_lab_procedures	0.000000	0
+metformin	0.000000	0
+number_diagnoses	0.000000	0
+
+
+
+
+
+
+
+
+
+
+-- SECTION 4.2 (Missingness by row (how incomplete are records?)) --
+
+
+{'missing_per_row_summary': {'count': 101766.0,
+  'mean': 3.830188864650276,
+  'std': 0.9344269760640691,
+  'min': 1.0,
+  '50%': 4.0,
+  '75%': 4.0,
+  '90%': 5.0,
+  '95%': 5.0,
+  '99%': 6.0,
+  'max': 9.0},
+ 'high_missing_fraction': 0.0}
+
+
+
+
+
+
+
+
+-- SECTION 4.3 --
+
+
+count	rate
+medical_specialty		
+__MISSING__	49949	0.490822
+InternalMedicine	14635	0.14381
+Emergency/Trauma	7565	0.074337
+Family/GeneralPractice	7440	0.073109
+Cardiology	5352	0.052591
+Surgery-General	3099	0.030452
+Nephrology	1613	0.01585
+Orthopedics	1400	0.013757
+Orthopedics-Reconstructive	1233	0.012116
+Radiologist	1140	0.011202
+Pulmonology	871	0.008559
+Psychiatry	854	0.008392
+Urology	685	0.006731
+ObstetricsandGynecology	671	0.006594
+Surgery-Cardiovascular/Thoracic	652	0.006407
+
+
+
+
+
+
+
+
+
+=== diag_1 | nunique=717 | top15 coverage=0.443 ===
+
+
+
+
+count	rate
+diag_1		
+428	6862	0.067429
+414	6581	0.064668
+786	4016	0.039463
+410	3614	0.035513
+486	3508	0.034471
+427	2766	0.02718
+491	2275	0.022355
+715	2151	0.021137
+682	2042	0.020066
+434	2028	0.019928
+780	2019	0.01984
+996	1967	0.019329
+276	1889	0.018562
+38	1688	0.016587
+250.8	1680	0.016508
+
+
+
+
+
+=== diag_2 | nunique=749 | top15 coverage=0.511 ===
+
+
+
+
+count	rate
+diag_2		
+276	6752	0.066348
+428	6662	0.065464
+250	6071	0.059656
+427	5036	0.049486
+401	3736	0.036712
+496	3305	0.032476
+599	3288	0.032309
+403	2823	0.02774
+414	2650	0.02604
+411	2566	0.025215
+250.02	2074	0.02038
+707	1999	0.019643
+585	1871	0.018385
+584	1649	0.016204
+491	1545	0.015182
+
+
+
+
+
+=== diag_3 | nunique=790 | top15 coverage=0.527 ===
+
+
+
+
+
+count	rate
+diag_3		
+250	11555	0.113545
+401	8289	0.081452
+276	5175	0.050852
+428	4577	0.044976
+427	3955	0.038864
+414	3664	0.036004
+496	2605	0.025598
+403	2357	0.023161
+585	1992	0.019574
+272	1969	0.019348
+599	1941	0.019073
+__MISSING__	1423	0.013983
+V45	1389	0.013649
+250.02	1369	0.013452
+707	1360	0.013364
+
+
+
+
+
+=== payer_code | nunique=18 | top15 coverage=0.999 ===
+
+
+
+count	rate
+payer_code		
+__MISSING__	40256	0.395574
+MC	32439	0.318761
+HM	6274	0.061651
+SP	5007	0.049201
+BC	4655	0.045742
+MD	3532	0.034707
+CP	2533	0.02489
+UN	2448	0.024055
+CM	1937	0.019034
+OG	1033	0.010151
+PO	592	0.005817
+DM	549	0.005395
+CH	146	0.001435
+WC	135	0.001327
+OT	95	0.000934
+
+
+
+
+
+
+
+---- SECTION 4.4 ----
+
+{'confusion_terms': {'tn': 18083, 'fp': 0, 'fn': 2271, 'tp': 0},
+ 'metrics': {'accuracy': 0.8884248796305394,
+  'precision': 0.0,
+  'recall': 0.0,
+  'f1': 0.0}}
+
+
+
+
+
+
+
+
+
+---- SECTION 5 ----
+
+-- SECTION 5.1 --
+
+FeatureGroups(numeric=['weight', 'time_in_hospital', 'num_lab_procedures', 'num_procedures', 'num_medications', 'number_outpatient', 'number_emergency', 'number_inpatient', 'number_diagnoses'], ordinal=['age'], categorical=['race', 'gender', 'payer_code', 'medical_specialty', 'diag_1', 'diag_2', 'diag_3', 'max_glu_serum', 'A1Cresult', 'metformin', 'repaglinide', 'nateglinide', 'chlorpropamide', 'glimepiride', 'acetohexamide', 'glipizide', 'glyburide', 'tolbutamide', 'pioglitazone', 'rosiglitazone', 'acarbose', 'miglitol', 'troglitazone', 'tolazamide', 'examide', 'citoglipton', 'insulin', 'glyburide-metformin', 'glipizide-metformin', 'glimepiride-pioglitazone', 'metformin-rosiglitazone', 'metformin-pioglitazone', 'change', 'diabetesMed', 'admission_type', 'discharge_disposition', 'admission_source'], dropped=['encounter_id', 'patient_nbr'])
+
+
+
+
+-- SECTION 5.2 --
+
+(scipy.sparse._csr.csr_matrix, (101766, 786))
+
+
+
+
+
+
+
+
+
+
+---- SECTION 6 ----
+
+
+strategy	n_splits	roc_auc_mean	roc_auc_std	precision_mean	precision_std	recall_mean	recall_std	f1_mean	f1_std	accuracy_mean	accuracy_std
+0	most_frequent	10.0	0.500000	0.000000	0.000000	0.00000	0.000000	0.000000	0.000000	0.000000	0.888401	0.000043
+1	stratified	10.0	0.502107	0.004082	0.115465	0.00749	0.111825	0.007248	0.113616	0.007367	0.805279	0.001621
+
+
+
+
+
+
+
+---- SECTION 7 ----
+
+
+
+'f5968b2fab085e7f54fd828ac2d60e09701e9a727701c3d6a99a4e5b64150ef5'
+
+
+
+
+
+---- SECTION 8 ----
+
+
+('f5968b2fab085e7f54fd828ac2d60e09701e9a727701c3d6a99a4e5b64150ef5',
+                  model  roc_auc_mean  roc_auc_std  precision_mean  \
+ 0  logistic_regression      0.669099     0.007565        0.489041   
+ 1        decision_tree      0.533919     0.004969        0.174375   
+ 
+    precision_std  recall_mean  recall_std   f1_mean    f1_std  accuracy_mean  \
+ 0       0.073716     0.022981    0.005932  0.043843  0.011026       0.888322   
+ 1       0.009321     0.167473    0.009299  0.170827  0.009044       0.818574   
+ 
+    accuracy_std  balanced_accuracy_mean  balanced_accuracy_std  
+ 0      0.000716                0.510003               0.002886  
+ 1      0.003050                0.533919               0.004969  )
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+

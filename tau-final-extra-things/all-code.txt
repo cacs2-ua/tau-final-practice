@@ -418,6 +418,40 @@ if __name__ == "__main__":
 
 
 
+# 2.1 Apply ID -> description mappings (recommended for interpretability)
+df = df_raw.copy()
+
+def apply_mapping(df: pd.DataFrame, id_col: str, new_col: str) -> pd.DataFrame:
+    if id_col not in df.columns or id_col not in id_maps:
+        return df
+    map_df = id_maps[id_col]
+    mapper = map_df.set_index(id_col)["description"]
+    mapper.index = mapper.index.astype("string")
+
+    keys = df[id_col].astype("string").str.strip()
+    df[new_col] = keys.map(mapper)  # unknown stays <NA>
+    return df
+
+df = apply_mapping(df, "admission_type_id", "admission_type")
+df = apply_mapping(df, "discharge_disposition_id", "discharge_disposition")
+df = apply_mapping(df, "admission_source_id", "admission_source")
+
+# Optionally drop the numeric ID columns to avoid duplicated information:
+df = df.drop(columns=[c for c in ["admission_type_id", "discharge_disposition_id", "admission_source_id"] if c in df.columns])
+
+# 2.2 Engineer targets (binary + optional multiclass)
+df = project_code.engineer_targets(
+    df,
+    source_col="readmitted",
+    binary_col="readmitted_30d",
+    multiclass_col="readmitted_3class",
+    add_multiclass=True,
+    drop_source=False,
+    unknown_policy="error",  # fail fast if something unexpected appears
+)
+
+# Quick sanity check
+df[["readmitted", "readmitted_30d", "readmitted_3class"]].head(), df["readmitted"].value_counts()
 
 
 
@@ -430,7 +464,9 @@ if __name__ == "__main__":
 
 
 
----- SECTION3 ----
+
+
+---- SECTION 3 ----
 
 
 %%writefile section3_dataset_understanding.py
@@ -1078,6 +1114,14 @@ if __name__ == "__main__":
 
 
 
+import section3_dataset_understanding as s3
+
+# Build the report object (tables you can directly use in the PDF report)
+rep = s3.profile_dataset(df)
+
+# Display key tables
+rep.data_dictionary.head(20), rep.missing_summary.head(20)
+rep.leakage_risks, rep.quality_risks.head(30)
 
 
 
@@ -1608,6 +1652,53 @@ class TestSection4EDAImbalance(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
+
+
+import section4_eda_imbalance as s4
+
+# 4.1 Class imbalance (binary)
+imb = s4.compute_class_imbalance(df["readmitted_30d"].astype(int))
+imb.as_dict()
+
+
+
+
+# 4.2 Missingness by feature (using the unified missing-token logic)
+mf = s4.missingness_by_feature(df)
+mf.head(25)
+
+
+
+# 4.2 Missingness by row (how incomplete are records?)
+mr = s4.missingness_by_row(df, high_missing_threshold=0.30)
+mr.as_dict()
+
+
+
+
+# 4.3 Top-K category distributions for known high-cardinality columns
+for col in ["medical_specialty", "diag_1", "diag_2", "diag_3", "payer_code"]:
+    if col in df.columns:
+        top, nunique, coverage = s4.topk_table(df[col], k=15)
+        print(f"\n=== {col} | nunique={nunique} | top15 coverage={coverage:.3f} ===")
+        display(top)
+
+
+
+
+
+# 4.4 Dummy "most_frequent" baseline on a simple train/test split (illustrative only)
+excluded = {"readmitted", "readmitted_30d", "readmitted_3class"}
+feature_cols = [c for c in df.columns if c not in excluded]
+
+dummy_res = s4.run_dummy_most_frequent_baseline(
+    df,
+    feature_cols=feature_cols,
+    target_col="readmitted_30d",
+    test_size=0.2,
+    random_state=42,
+)
+dummy_res.as_dict()
 
 
 
@@ -2313,4 +2404,1639 @@ class TestSection5PreprocessingPipeline(unittest.TestCase):
         self.assertEqual(len(scores), n_splits)
         self.assertTrue(np.isfinite(scores).all())
 
+
+
+
+
+
+
+import section5_preprocessing_pipeline as s5
+
+cfg = s5.DiabetesPreprocessConfig(
+    onehot_sparse=True,     # recommended for ~100k rows + many categoricals
+    rare_min_count=50,      # group very rare categories into __OTHER__
+)
+
+groups = s5.infer_feature_groups(df, cfg)
+groups
+
+
+
+
+
+
+pre = s5.build_preprocessor(df, cfg)
+
+X = df.drop(columns=[c for c in ["readmitted", "readmitted_30d", "readmitted_3class"] if c in df.columns])
+y = df["readmitted_30d"].astype(int)
+
+pre.fit(X, y)
+Xt = pre.transform(X)
+
+type(Xt), Xt.shape
+
+
+
+
+
+
+
+
+----- SECTION 6 -----
+
+
+%%writefile section6_baseline_system.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+from sklearn.dummy import DummyClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    make_scorer,
+    precision_score,
+    recall_score,
+)
+from sklearn.model_selection import StratifiedKFold, cross_validate
+from sklearn.pipeline import Pipeline
+
+import section5_preprocessing_pipeline as s5
+
+
+# ---------------------------------------------------------------------
+# Section 6 — Baseline System (DummyClassifier sanity-check)
+# ---------------------------------------------------------------------
+# Required by the practice:
+#   - Baseline ROC-AUC from a DummyClassifier
+# Also report clinically interpretable metrics:
+#   - Precision / Recall / F1 (minority class = 1)
+#
+# We evaluate using Stratified K-Fold CV (same philosophy as later sections),
+# and we keep random_state fixed for reproducibility and fair comparisons.
+# ---------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BaselineCVResult:
+    strategy: str
+    n_splits: int
+    fold_scores: Dict[str, np.ndarray]
+    mean_scores: Dict[str, float]
+    std_scores: Dict[str, float]
+
+    def as_row(self) -> Dict[str, float]:
+        row: Dict[str, float] = {"strategy": self.strategy, "n_splits": float(self.n_splits)}
+        for k, v in self.mean_scores.items():
+            row[f"{k}_mean"] = float(v)
+        for k, v in self.std_scores.items():
+            row[f"{k}_std"] = float(v)
+        return row
+
+
+def _validate_binary_target(y: pd.Series) -> pd.Series:
+    if y.isna().any():
+        raise ValueError("Target contains missing values; baseline evaluation requires a clean binary target.")
+    uniq = set(pd.Series(y).astype(int).unique().tolist())
+    if not uniq.issubset({0, 1}):
+        raise ValueError(f"Target must be binary in {{0,1}}, found values: {sorted(list(uniq))}")
+    return pd.Series(y).astype(int)
+
+
+def _default_feature_frame(df: pd.DataFrame, *, target_col: str, config: s5.DiabetesPreprocessConfig) -> pd.DataFrame:
+    drop_cols = [c for c in config.target_cols if c in df.columns]
+    if target_col in df.columns and target_col not in drop_cols:
+        drop_cols.append(target_col)
+    X = df.drop(columns=drop_cols, errors="ignore")
+    if X.shape[1] == 0:
+        raise ValueError("No feature columns available after dropping target columns.")
+    return X
+
+
+def _scorers_binary() -> Dict[str, object]:
+    # zero_division=0 avoids warnings when a baseline predicts no positives
+    return {
+        "roc_auc": "roc_auc",
+        "accuracy": make_scorer(accuracy_score),
+        "precision": make_scorer(precision_score, zero_division=0),
+        "recall": make_scorer(recall_score, zero_division=0),
+        "f1": make_scorer(f1_score, zero_division=0),
+    }
+
+
+def evaluate_dummy_baseline_cv(
+    df: pd.DataFrame,
+    *,
+    target_col: str = "readmitted_30d",
+    strategy: str = "most_frequent",
+    n_splits: int = 10,
+    cv_random_state: int = 42,
+    dummy_random_state: int = 42,
+    preprocess_config: Optional[s5.DiabetesPreprocessConfig] = None,
+) -> BaselineCVResult:
+    """
+    Evaluate a DummyClassifier baseline under Stratified K-Fold CV.
+
+    Parameters
+    ----------
+    df:
+        DataFrame containing features + a binary target column.
+    target_col:
+        Name of the binary target (1 = readmitted <30 days, 0 = otherwise).
+    strategy:
+        DummyClassifier strategy, e.g. "most_frequent" or "stratified".
+    n_splits:
+        Number of CV folds (10 required later; baseline can already match it).
+    cv_random_state:
+        Seed for fold generation (must be fixed for reproducibility).
+    dummy_random_state:
+        Seed for DummyClassifier randomness (relevant for "stratified"/"uniform").
+    preprocess_config:
+        If provided, used to build the exact same preprocessing pipeline as later models.
+
+    Returns
+    -------
+    BaselineCVResult:
+        Per-fold scores + mean/std for:
+        roc_auc, accuracy, precision, recall, f1
+    """
+    if preprocess_config is None:
+        preprocess_config = s5.DiabetesPreprocessConfig()
+
+    if target_col not in df.columns:
+        raise KeyError(f"Target column '{target_col}' not found. Available: {list(df.columns)}")
+
+    y = _validate_binary_target(df[target_col])
+    X = _default_feature_frame(df, target_col=target_col, config=preprocess_config)
+
+    # Build preprocessing “single source of truth” (Section 5),
+    # then attach the dummy baseline classifier.
+    pre = s5.build_preprocessor(df, preprocess_config)
+
+    clf = DummyClassifier(strategy=strategy, random_state=dummy_random_state)
+    pipe = Pipeline(steps=[("pre", pre), ("dummy", clf)])
+
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=cv_random_state)
+    scoring = _scorers_binary()
+
+    out = cross_validate(
+        pipe,
+        X,
+        y,
+        cv=cv,
+        scoring=scoring,
+        return_train_score=False,
+        n_jobs=None,
+    )
+
+    fold_scores: Dict[str, np.ndarray] = {}
+    for key in scoring.keys():
+        fold_scores[key] = np.asarray(out[f"test_{key}"], dtype=float)
+
+    mean_scores = {k: float(np.mean(v)) for k, v in fold_scores.items()}
+    std_scores = {k: float(np.std(v, ddof=1)) if len(v) > 1 else 0.0 for k, v in fold_scores.items()}
+
+    return BaselineCVResult(
+        strategy=strategy,
+        n_splits=n_splits,
+        fold_scores=fold_scores,
+        mean_scores=mean_scores,
+        std_scores=std_scores,
+    )
+
+
+def run_dummy_baselines(
+    df: pd.DataFrame,
+    *,
+    target_col: str = "readmitted_30d",
+    strategies: Sequence[str] = ("most_frequent", "stratified"),
+    n_splits: int = 10,
+    cv_random_state: int = 42,
+    dummy_random_state: int = 42,
+    preprocess_config: Optional[s5.DiabetesPreprocessConfig] = None,
+) -> pd.DataFrame:
+    """
+    Convenience helper: evaluate multiple DummyClassifier baselines
+    and return a compact results table (mean ± std across folds).
+    """
+    rows: List[Dict[str, float]] = []
+    for strat in strategies:
+        res = evaluate_dummy_baseline_cv(
+            df,
+            target_col=target_col,
+            strategy=strat,
+            n_splits=n_splits,
+            cv_random_state=cv_random_state,
+            dummy_random_state=dummy_random_state,
+            preprocess_config=preprocess_config,
+        )
+        rows.append(res.as_row())
+
+    table = pd.DataFrame(rows)
+    # Nice ordering for the report/table
+    preferred = [
+        "strategy",
+        "n_splits",
+        "roc_auc_mean",
+        "roc_auc_std",
+        "precision_mean",
+        "precision_std",
+        "recall_mean",
+        "recall_std",
+        "f1_mean",
+        "f1_std",
+        "accuracy_mean",
+        "accuracy_std",
+    ]
+    cols = [c for c in preferred if c in table.columns] + [c for c in table.columns if c not in preferred]
+    return table[cols]
+
+
+
+
+
+
+%%writefile test_section6_baseline_system.py
+import unittest
+import numpy as np
+import pandas as pd
+
+import section6_baseline_system as s6
+import section5_preprocessing_pipeline as s5
+
+
+class TestSection6BaselineSystem(unittest.TestCase):
+    def _toy_diabetes_like_df(self, n: int = 120) -> pd.DataFrame:
+        rng = np.random.RandomState(0)
+
+        # Fixed imbalance: 20% positives (early readmission)
+        y = np.array([0] * int(n * 0.8) + [1] * (n - int(n * 0.8)), dtype=int)
+        rng.shuffle(y)
+
+        ages = list(s5.AGE_ORDER)
+        df = pd.DataFrame(
+            {
+                "encounter_id": np.arange(n),
+                "patient_nbr": np.arange(10_000, 10_000 + n),
+                "age": rng.choice(ages, size=n),
+                "weight": rng.choice(["?", "70", "80", "90"], size=n),
+                "num_lab_procedures": rng.poisson(lam=40, size=n),
+                "admission_type_id": rng.choice([1, 2, 6], size=n),
+                "medical_specialty": rng.choice(["Cardiology", "InternalMedicine", "?", "RareSpec"], size=n),
+                "diag_1": rng.choice(["250.83", "276", "648", "8"], size=n),
+                "readmitted_30d": y,
+            }
+        )
+        return df
+
+    def test_evaluate_most_frequent_baseline_expected_behavior(self):
+        df = self._toy_diabetes_like_df(n=120)
+
+        cfg = s5.DiabetesPreprocessConfig(onehot_sparse=False, rare_min_count=1)
+
+        res = s6.evaluate_dummy_baseline_cv(
+            df,
+            target_col="readmitted_30d",
+            strategy="most_frequent",
+            n_splits=4,
+            cv_random_state=0,
+            dummy_random_state=0,
+            preprocess_config=cfg,
+        )
+
+        self.assertEqual(res.strategy, "most_frequent")
+        self.assertEqual(res.n_splits, 4)
+
+        # Fold arrays exist and have correct length
+        for k in ["roc_auc", "precision", "recall", "f1", "accuracy"]:
+            self.assertIn(k, res.fold_scores)
+            self.assertEqual(len(res.fold_scores[k]), 4)
+            self.assertTrue(np.isfinite(res.fold_scores[k]).all())
+
+        # Most-frequent baseline predicts only the majority class => recall/F1 for positives should be 0
+        self.assertAlmostEqual(res.mean_scores["recall"], 0.0, places=12)
+        self.assertAlmostEqual(res.mean_scores["f1"], 0.0, places=12)
+
+        # Constant scoring => ROC-AUC should be chance-level (~0.5)
+        self.assertAlmostEqual(res.mean_scores["roc_auc"], 0.5, places=12)
+
+    def test_evaluate_stratified_baseline_runs_and_scores_are_valid(self):
+        df = self._toy_diabetes_like_df(n=120)
+        cfg = s5.DiabetesPreprocessConfig(onehot_sparse=False, rare_min_count=1)
+
+        res = s6.evaluate_dummy_baseline_cv(
+            df,
+            target_col="readmitted_30d",
+            strategy="stratified",
+            n_splits=4,
+            cv_random_state=0,
+            dummy_random_state=0,
+            preprocess_config=cfg,
+        )
+
+        # Basic sanity: fold scores exist and are finite
+        for k in ["roc_auc", "precision", "recall", "f1", "accuracy"]:
+            self.assertIn(k, res.fold_scores)
+            self.assertEqual(len(res.fold_scores[k]), 4)
+            self.assertTrue(np.isfinite(res.fold_scores[k]).all())
+
+        # Mean scores must be within [0,1]
+        for k, v in res.mean_scores.items():
+            self.assertGreaterEqual(v, 0.0)
+            self.assertLessEqual(v, 1.0)
+
+        # Chance-level discrimination is *approximately* 0.5 for a random baseline.
+        # Do NOT assert exact 0.5 due to finite-sample variability.
+        roc = res.mean_scores["roc_auc"]
+        self.assertGreaterEqual(roc, 0.35)
+        self.assertLessEqual(roc, 0.65)
+
+
+    def test_run_dummy_baselines_returns_table_with_expected_columns(self):
+        df = self._toy_diabetes_like_df(n=120)
+        cfg = s5.DiabetesPreprocessConfig(onehot_sparse=False, rare_min_count=1)
+
+        table = s6.run_dummy_baselines(
+            df,
+            target_col="readmitted_30d",
+            strategies=("most_frequent", "stratified"),
+            n_splits=4,
+            cv_random_state=0,
+            dummy_random_state=0,
+            preprocess_config=cfg,
+        )
+
+        self.assertEqual(table.shape[0], 2)
+        self.assertIn("strategy", table.columns)
+        self.assertIn("roc_auc_mean", table.columns)
+        self.assertIn("f1_mean", table.columns)
+        self.assertTrue(set(table["strategy"].tolist()) == {"most_frequent", "stratified"})
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+
+
+
+
+
+
+
+
+import section6_baseline_system as s6
+
+baseline_table = s6.run_dummy_baselines(
+    df,
+    target_col="readmitted_30d",
+    strategies=("most_frequent", "stratified"),
+    n_splits=10,
+    cv_random_state=42,
+    dummy_random_state=42,
+    preprocess_config=cfg,
+)
+baseline_table
+
+
+
+
+---- SECTION 7 ----
+
+%%writefile section7_validation_protocol.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import hashlib
+import numpy as np
+import pandas as pd
+
+from sklearn.base import clone
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import StratifiedKFold
+
+
+Split = Tuple[np.ndarray, np.ndarray]
+
+
+# ---------------------------------------------------------------------
+# Section 7 — Single, reusable 10-fold CV protocol (identical folds)
+# ---------------------------------------------------------------------
+
+
+def make_stratified_cv_splits(
+    y: Iterable[int],
+    *,
+    n_splits: int = 10,
+    shuffle: bool = True,
+    random_state: int = 42,
+) -> List[Split]:
+    """
+    Create one fixed set of Stratified K-Fold splits (train_idx, test_idx),
+    to be REUSED across all experiments (baseline, models, imbalance methods,
+    selection, PCA, tuning outer loop).
+
+    This is the "identical folds across comparisons" contract required by the practice.
+    """
+    y_arr = np.asarray(list(y), dtype=int)
+    if y_arr.ndim != 1:
+        raise ValueError("y must be a 1D iterable of binary labels.")
+    if len(y_arr) == 0:
+        raise ValueError("y is empty.")
+    uniq = set(np.unique(y_arr).tolist())
+    if not uniq.issubset({0, 1}):
+        raise ValueError(f"y must be binary in {{0,1}}. Found: {sorted(list(uniq))}")
+
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=shuffle, random_state=random_state)
+    splits: List[Split] = []
+    X_dummy = np.zeros((len(y_arr), 1), dtype=float)  # splitter needs X, but doesn't use it
+    for tr, te in cv.split(X_dummy, y_arr):
+        splits.append((np.asarray(tr, dtype=np.int64), np.asarray(te, dtype=np.int64)))
+
+    validate_cv_splits(splits, n_samples=len(y_arr), n_splits_expected=n_splits)
+    return splits
+
+
+def validate_cv_splits(
+    splits: Sequence[Split],
+    *,
+    n_samples: int,
+    n_splits_expected: Optional[int] = None,
+) -> None:
+    """
+    Sanity checks:
+      - correct number of folds (if provided)
+      - each test fold disjoint
+      - union of test indices covers all samples exactly once
+      - train/test disjoint per fold
+    """
+    if n_samples <= 0:
+        raise ValueError("n_samples must be > 0.")
+    if n_splits_expected is not None and len(splits) != int(n_splits_expected):
+        raise ValueError(f"Expected {n_splits_expected} folds, got {len(splits)}.")
+
+    seen_test = np.zeros(n_samples, dtype=int)
+
+    for i, (tr, te) in enumerate(splits):
+        tr = np.asarray(tr, dtype=np.int64)
+        te = np.asarray(te, dtype=np.int64)
+
+        if tr.ndim != 1 or te.ndim != 1:
+            raise ValueError(f"Fold {i}: indices must be 1D arrays.")
+        if len(te) == 0:
+            raise ValueError(f"Fold {i}: empty test fold.")
+        if np.intersect1d(tr, te).size != 0:
+            raise ValueError(f"Fold {i}: train/test overlap detected.")
+
+        if tr.min() < 0 or te.min() < 0 or tr.max() >= n_samples or te.max() >= n_samples:
+            raise ValueError(f"Fold {i}: indices out of bounds for n_samples={n_samples}.")
+
+        # track test coverage
+        for idx in te:
+            seen_test[idx] += 1
+
+    if not np.all(seen_test == 1):
+        bad = np.where(seen_test != 1)[0]
+        raise ValueError(
+            "Test folds must cover every sample exactly once. "
+            f"Violations at indices: {bad[:20].tolist()} (showing up to 20)."
+        )
+
+
+def cv_splits_fingerprint(splits: Sequence[Split]) -> str:
+    """
+    Stable hash identifying the exact fold partitioning.
+    Useful to assert fold identity across experiments and for reproducibility logs.
+    """
+    h = hashlib.sha256()
+    h.update(str(len(splits)).encode("utf-8"))
+    for tr, te in splits:
+        tr = np.asarray(tr, dtype=np.int64)
+        te = np.asarray(te, dtype=np.int64)
+        h.update(tr.tobytes())
+        h.update(b"|")
+        h.update(te.tobytes())
+        h.update(b";")
+    return h.hexdigest()
+
+
+def _final_estimator(pipeline_or_estimator):
+    if hasattr(pipeline_or_estimator, "steps") and pipeline_or_estimator.steps:
+        return pipeline_or_estimator.steps[-1][1]
+    return pipeline_or_estimator
+
+
+def _get_score_vector(pipeline_or_estimator, X, *, positive_label: int = 1) -> np.ndarray:
+    """
+    Get continuous scores for ROC-AUC:
+      - predict_proba[:, pos] if available
+      - else decision_function if available
+      - else raise (to avoid meaningless AUC from hard labels)
+    """
+    if hasattr(pipeline_or_estimator, "predict_proba"):
+        proba = pipeline_or_estimator.predict_proba(X)
+        proba = np.asarray(proba)
+        if proba.ndim != 2 or proba.shape[1] < 2:
+            raise ValueError("predict_proba output must be [n_samples, 2+] for binary ROC-AUC.")
+        est = _final_estimator(pipeline_or_estimator)
+        classes = getattr(est, "classes_", None)
+        if classes is None:
+            # fallback: assume column 1 is positive
+            pos_idx = 1
+        else:
+            classes = np.asarray(classes)
+            if positive_label in set(classes.tolist()):
+                pos_idx = int(np.where(classes == positive_label)[0][0])
+            else:
+                pos_idx = 1
+        return proba[:, pos_idx].astype(float)
+
+    if hasattr(pipeline_or_estimator, "decision_function"):
+        s = pipeline_or_estimator.decision_function(X)
+        return np.asarray(s, dtype=float).ravel()
+
+    raise ValueError("Estimator must expose predict_proba or decision_function to compute ROC-AUC.")
+
+
+@dataclass(frozen=True)
+class CVEvaluationResult:
+    n_splits: int
+    split_fingerprint: str
+    fold_indices: List[Split]
+    fold_scores: Dict[str, np.ndarray]
+    mean_scores: Dict[str, float]
+    std_scores: Dict[str, float]
+    oof_pred: Optional[np.ndarray] = None
+    oof_score: Optional[np.ndarray] = None
+
+
+def evaluate_binary_pipeline_cv(
+    pipeline,
+    X,
+    y: Iterable[int],
+    *,
+    cv_splits: Sequence[Split],
+    positive_label: int = 1,
+    metrics: Sequence[str] = ("roc_auc", "accuracy", "precision", "recall", "f1", "balanced_accuracy"),
+    return_oof: bool = True,
+) -> CVEvaluationResult:
+    """
+    Manual CV loop to guarantee:
+      - identical folds (cv_splits provided)
+      - per-fold metric vectors (needed later for Wilcoxon)
+      - optional out-of-fold predictions/scores (useful for error analysis / XAI)
+    """
+    y_arr = np.asarray(list(y), dtype=int)
+    n = len(y_arr)
+    validate_cv_splits(cv_splits, n_samples=n)
+    fp = cv_splits_fingerprint(cv_splits)
+
+    wanted = set(metrics)
+    allowed = {"roc_auc", "accuracy", "precision", "recall", "f1", "balanced_accuracy"}
+    if not wanted.issubset(allowed):
+        raise ValueError(f"Unsupported metrics requested: {sorted(list(wanted - allowed))}")
+
+    fold_scores: Dict[str, List[float]] = {m: [] for m in metrics}
+
+    oof_pred = np.full(n, fill_value=-1, dtype=int) if return_oof else None
+    oof_score = np.full(n, fill_value=np.nan, dtype=float) if return_oof else None
+
+    for tr, te in cv_splits:
+        tr = np.asarray(tr, dtype=np.int64)
+        te = np.asarray(te, dtype=np.int64)
+
+        model = clone(pipeline)
+        model.fit(_safe_index(X, tr), y_arr[tr])
+
+        y_pred = np.asarray(model.predict(_safe_index(X, te)), dtype=int)
+
+        if "roc_auc" in wanted:
+            y_score = _get_score_vector(model, _safe_index(X, te), positive_label=positive_label)
+            fold_scores["roc_auc"].append(float(roc_auc_score(y_arr[te], y_score)))
+        else:
+            y_score = None
+
+        if "accuracy" in wanted:
+            fold_scores["accuracy"].append(float(accuracy_score(y_arr[te], y_pred)))
+        if "precision" in wanted:
+            fold_scores["precision"].append(float(precision_score(y_arr[te], y_pred, pos_label=positive_label, zero_division=0)))
+        if "recall" in wanted:
+            fold_scores["recall"].append(float(recall_score(y_arr[te], y_pred, pos_label=positive_label, zero_division=0)))
+        if "f1" in wanted:
+            fold_scores["f1"].append(float(f1_score(y_arr[te], y_pred, pos_label=positive_label, zero_division=0)))
+        if "balanced_accuracy" in wanted:
+            fold_scores["balanced_accuracy"].append(float(balanced_accuracy_score(y_arr[te], y_pred)))
+
+        if return_oof:
+            oof_pred[te] = y_pred
+            if y_score is not None:
+                oof_score[te] = np.asarray(y_score, dtype=float)
+
+    fold_scores_arr: Dict[str, np.ndarray] = {k: np.asarray(v, dtype=float) for k, v in fold_scores.items()}
+    mean_scores = {k: float(np.mean(v)) for k, v in fold_scores_arr.items()}
+    std_scores = {k: float(np.std(v, ddof=1)) if len(v) > 1 else 0.0 for k, v in fold_scores_arr.items()}
+
+    return CVEvaluationResult(
+        n_splits=len(cv_splits),
+        split_fingerprint=fp,
+        fold_indices=[(np.asarray(tr, dtype=np.int64), np.asarray(te, dtype=np.int64)) for tr, te in cv_splits],
+        fold_scores=fold_scores_arr,
+        mean_scores=mean_scores,
+        std_scores=std_scores,
+        oof_pred=oof_pred,
+        oof_score=oof_score,
+    )
+
+
+def _safe_index(X, idx: np.ndarray):
+    """
+    Index X robustly whether it's a pandas DataFrame/Series or a numpy array / sparse matrix.
+    """
+    if isinstance(X, (pd.DataFrame, pd.Series)):
+        return X.iloc[idx]
+    return X[idx]
+
+
+
+
+
+%%writefile test_section7_validation_protocol.py
+import unittest
+import numpy as np
+import pandas as pd
+
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+
+import section7_validation_protocol as s7
+import section5_preprocessing_pipeline as s5
+
+
+def _splits_equal(a, b) -> bool:
+    if len(a) != len(b):
+        return False
+    for (tr1, te1), (tr2, te2) in zip(a, b):
+        if not (np.array_equal(tr1, tr2) and np.array_equal(te1, te2)):
+            return False
+    return True
+
+
+class TestSection7ValidationProtocol(unittest.TestCase):
+    def _toy_diabetes_like_df(self, n: int = 200) -> pd.DataFrame:
+        rng = np.random.RandomState(0)
+
+        # 20% positives, 80% negatives
+        y = np.array([0] * int(n * 0.8) + [1] * (n - int(n * 0.8)), dtype=int)
+        rng.shuffle(y)
+
+        ages = list(s5.AGE_ORDER)
+        df = pd.DataFrame(
+            {
+                "encounter_id": np.arange(n),
+                "patient_nbr": np.arange(10_000, 10_000 + n),
+                "age": rng.choice(ages, size=n),
+                "weight": rng.choice(["?", "70", "80", "90", "Unknown/Invalid"], size=n),
+                "num_lab_procedures": rng.poisson(lam=40, size=n),
+                "admission_type_id": rng.choice([1, 2, 6], size=n),
+                "medical_specialty": rng.choice(["Cardiology", "InternalMedicine", "?", "RareSpec"], size=n),
+                "diag_1": rng.choice(["250.83", "276", "648", "8"], size=n),
+                "readmitted_30d": y,
+            }
+        )
+        return df
+
+    def test_make_stratified_cv_splits_reproducible_and_valid(self):
+        df = self._toy_diabetes_like_df(n=200)
+        y = df["readmitted_30d"].astype(int).tolist()
+
+        splits1 = s7.make_stratified_cv_splits(y, n_splits=10, random_state=42)
+        splits2 = s7.make_stratified_cv_splits(y, n_splits=10, random_state=42)
+
+        self.assertTrue(_splits_equal(splits1, splits2))
+        # validate should not raise
+        s7.validate_cv_splits(splits1, n_samples=len(y), n_splits_expected=10)
+
+    def test_cv_fingerprint_changes_with_seed(self):
+        df = self._toy_diabetes_like_df(n=200)
+        y = df["readmitted_30d"].astype(int).tolist()
+
+        s0 = s7.make_stratified_cv_splits(y, n_splits=10, random_state=0)
+        s1 = s7.make_stratified_cv_splits(y, n_splits=10, random_state=1)
+
+        fp0 = s7.cv_splits_fingerprint(s0)
+        fp1 = s7.cv_splits_fingerprint(s1)
+
+        self.assertNotEqual(fp0, fp1)
+
+    def test_evaluate_binary_pipeline_cv_returns_fold_scores_and_oof(self):
+        df = self._toy_diabetes_like_df(n=200)
+        y = df["readmitted_30d"].astype(int)
+        X = df.drop(columns=["readmitted_30d"])
+
+        cfg = s5.DiabetesPreprocessConfig(onehot_sparse=False, rare_min_count=1)
+        pre = s5.build_preprocessor(df, cfg)
+
+        pipe = Pipeline(
+            steps=[
+                ("pre", pre),
+                ("clf", LogisticRegression(max_iter=1000)),
+            ]
+        )
+
+        splits = s7.make_stratified_cv_splits(y, n_splits=10, random_state=42)
+        res = s7.evaluate_binary_pipeline_cv(pipe, X, y, cv_splits=splits, return_oof=True)
+
+        self.assertEqual(res.n_splits, 10)
+        self.assertEqual(len(res.fold_scores["roc_auc"]), 10)
+        self.assertTrue(np.isfinite(res.fold_scores["roc_auc"]).all())
+
+        # means in [0,1]
+        for v in res.mean_scores.values():
+            self.assertGreaterEqual(v, 0.0)
+            self.assertLessEqual(v, 1.0)
+
+        # OOF outputs cover all rows
+        self.assertIsNotNone(res.oof_pred)
+        self.assertIsNotNone(res.oof_score)
+        self.assertEqual(len(res.oof_pred), len(df))
+        self.assertEqual(len(res.oof_score), len(df))
+        self.assertTrue(np.isfinite(res.oof_score).all())
+
+    def test_two_models_share_identical_folds(self):
+        df = self._toy_diabetes_like_df(n=200)
+        y = df["readmitted_30d"].astype(int)
+        X = df.drop(columns=["readmitted_30d"])
+
+        cfg = s5.DiabetesPreprocessConfig(onehot_sparse=False, rare_min_count=1)
+        pre = s5.build_preprocessor(df, cfg)
+
+        splits = s7.make_stratified_cv_splits(y, n_splits=10, random_state=42)
+
+        pipe_lr = Pipeline([("pre", pre), ("clf", LogisticRegression(max_iter=1000))])
+        pipe_dt = Pipeline([("pre", pre), ("clf", DecisionTreeClassifier(random_state=0))])
+
+        r1 = s7.evaluate_binary_pipeline_cv(pipe_lr, X, y, cv_splits=splits, return_oof=False)
+        r2 = s7.evaluate_binary_pipeline_cv(pipe_dt, X, y, cv_splits=splits, return_oof=False)
+
+        self.assertEqual(r1.split_fingerprint, r2.split_fingerprint)
+        self.assertTrue(_splits_equal(r1.fold_indices, r2.fold_indices))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+
+
+
+
+
+
+
+
+
+import section7_validation_protocol as s7
+
+y = df["readmitted_30d"].astype(int).to_numpy()
+
+splits = s7.make_stratified_cv_splits(
+    y,
+    n_splits=10,
+    shuffle=True,
+    random_state=42,   # keep fixed for reproducibility + Wilcoxon later
+)
+
+fingerprint = s7.cv_splits_fingerprint(splits)
+fingerprint
+
+
+
+
+
+
+
+
+---- SECTION 8 ----
+ 
+  
+%%writefile section8_core_modeling.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.tree import DecisionTreeClassifier
+
+import section5_preprocessing_pipeline as s5
+import section7_validation_protocol as s7
+
+
+# ---------------------------------------------------------------------
+# Section 8 — Core Modeling (Basic Level)
+# - Train and analyze >= 2 different classifiers
+# - Must use identical 10-fold CV splits across comparisons (Section 7)
+# - Models here: Logistic Regression (linear/probabilistic) + Decision Tree (rule-based/non-linear)
+#
+# Notes:
+# - Decision trees are commonly restricted to CSC sparse matrices in sklearn;
+#   we add a lightweight converter to avoid format-related failures while keeping sparse encoding.
+# - Preprocessing is the single-source-of-truth from Section 5 (no leakage: fit inside CV folds).
+# ---------------------------------------------------------------------
+
+
+class SparseToCSC(BaseEstimator, TransformerMixin):
+    """Convert sparse matrices to CSC (DecisionTree often expects CSC when input is sparse)."""
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        try:
+            from scipy import sparse  # scipy is a dependency of sklearn in most environments
+        except Exception as e:
+            raise RuntimeError(
+                "scipy is required for sparse matrix conversion. "
+                "Install with: pip install scipy"
+            ) from e
+
+        if sparse.issparse(X):
+            return X.tocsc()
+        return X
+
+
+def _validate_binary_target(y: pd.Series) -> np.ndarray:
+    if y.isna().any():
+        raise ValueError("Target contains missing values; Section 8 requires a clean binary target.")
+    y_arr = np.asarray(pd.Series(y).astype(int).tolist(), dtype=int)
+    uniq = set(np.unique(y_arr).tolist())
+    if not uniq.issubset({0, 1}):
+        raise ValueError(f"Target must be binary in {{0,1}}, found values: {sorted(list(uniq))}")
+    return y_arr
+
+
+def _default_X_y(
+    df: pd.DataFrame,
+    *,
+    target_col: str,
+    preprocess_config: s5.DiabetesPreprocessConfig,
+) -> Tuple[pd.DataFrame, np.ndarray]:
+    if target_col not in df.columns:
+        raise KeyError(f"Target column '{target_col}' not found. Available: {list(df.columns)}")
+
+    y_arr = _validate_binary_target(df[target_col])
+
+    drop_cols = [c for c in preprocess_config.target_cols if c in df.columns]
+    if target_col in df.columns and target_col not in drop_cols:
+        drop_cols.append(target_col)
+
+    X = df.drop(columns=drop_cols, errors="ignore")
+    if X.shape[1] == 0:
+        raise ValueError("No feature columns available after dropping target columns.")
+    return X, y_arr
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    name: str
+    estimator: Any
+    require_csc: bool = False
+
+
+def build_section8_model_specs(
+    *,
+    random_state: int = 42,
+) -> List[ModelSpec]:
+    """
+    Two conceptually different classifiers:
+      1) Logistic Regression (linear, probabilistic)
+      2) Decision Tree (rule-based, non-linear)
+
+    We pick a LR solver compatible with sparse one-hot features ("saga").
+    """
+    lr = LogisticRegression(
+        solver="saga",
+        penalty="l2",
+        max_iter=2000,
+        random_state=random_state,
+        n_jobs=-1,
+    )
+    dt = DecisionTreeClassifier(
+        random_state=random_state,
+    )
+
+    return [
+        ModelSpec(name="logistic_regression", estimator=lr, require_csc=False),
+        ModelSpec(name="decision_tree", estimator=dt, require_csc=True),
+    ]
+
+
+def build_section8_pipelines(
+    df: pd.DataFrame,
+    *,
+    preprocess_config: Optional[s5.DiabetesPreprocessConfig] = None,
+    model_random_state: int = 42,
+) -> Dict[str, Pipeline]:
+    """
+    Build model pipelines = preprocessing (Section 5) + optional format adapter + classifier.
+    """
+    if preprocess_config is None:
+        preprocess_config = s5.DiabetesPreprocessConfig()
+
+    pre = s5.build_preprocessor(df, preprocess_config)
+    specs = build_section8_model_specs(random_state=model_random_state)
+
+    pipes: Dict[str, Pipeline] = {}
+    for spec in specs:
+        steps = [("pre", pre)]
+        if spec.require_csc:
+            steps.append(("to_csc", SparseToCSC()))
+        steps.append(("clf", spec.estimator))
+        pipes[spec.name] = Pipeline(steps=steps)
+
+    return pipes
+
+
+@dataclass(frozen=True)
+class Section8RunResult:
+    """
+    Holds everything you need for the report:
+      - identical-fold CV metrics (mean/std + per-fold vectors)
+      - fold fingerprint for reproducibility
+    """
+    target_col: str
+    n_splits: int
+    cv_random_state: int
+    split_fingerprint: str
+    results_by_model: Dict[str, s7.CVEvaluationResult]
+    summary_table: pd.DataFrame
+
+
+def _summary_table_from_results(
+    results_by_model: Dict[str, s7.CVEvaluationResult],
+    *,
+    model_order: Sequence[str],
+    metrics: Sequence[str],
+) -> pd.DataFrame:
+    rows: List[Dict[str, float]] = []
+
+    for name in model_order:
+        r = results_by_model[name]
+        row: Dict[str, float] = {"model": name}
+        for m in metrics:
+            row[f"{m}_mean"] = float(r.mean_scores[m])
+            row[f"{m}_std"] = float(r.std_scores[m])
+        rows.append(row)
+
+    cols = ["model"] + [f"{m}_{s}" for m in metrics for s in ("mean", "std")]
+    return pd.DataFrame(rows)[cols]
+
+
+def run_section8_core_models(
+    df: pd.DataFrame,
+    *,
+    target_col: str = "readmitted_30d",
+    preprocess_config: Optional[s5.DiabetesPreprocessConfig] = None,
+    n_splits: int = 10,
+    cv_random_state: int = 42,
+    model_random_state: int = 42,
+    metrics: Sequence[str] = ("roc_auc", "precision", "recall", "f1", "accuracy", "balanced_accuracy"),
+    return_oof: bool = True,
+    cv_splits: Optional[Sequence[s7.Split]] = None,
+) -> Section8RunResult:
+    """
+    End-to-end Section 8 runner:
+      - builds preprocessing + LR + DT pipelines
+      - creates/reuses identical stratified splits (10-fold by default)
+      - evaluates each model with the manual CV loop (Section 7)
+      - returns a compact mean±std table + full per-fold vectors
+    """
+    if preprocess_config is None:
+        preprocess_config = s5.DiabetesPreprocessConfig()
+
+    X, y = _default_X_y(df, target_col=target_col, preprocess_config=preprocess_config)
+
+    if cv_splits is None:
+        cv_splits = s7.make_stratified_cv_splits(
+            y,
+            n_splits=n_splits,
+            shuffle=True,
+            random_state=cv_random_state,
+        )
+    else:
+        s7.validate_cv_splits(cv_splits, n_samples=len(y), n_splits_expected=n_splits)
+
+    fp = s7.cv_splits_fingerprint(cv_splits)
+
+    pipes = build_section8_pipelines(
+        df,
+        preprocess_config=preprocess_config,
+        model_random_state=model_random_state,
+    )
+
+    # Evaluate with identical folds
+    results_by_model: Dict[str, s7.CVEvaluationResult] = {}
+    for name, pipe in pipes.items():
+        res = s7.evaluate_binary_pipeline_cv(
+            pipe,
+            X,
+            y,
+            cv_splits=cv_splits,
+            metrics=metrics,
+            return_oof=return_oof,
+        )
+        results_by_model[name] = res
+
+    model_order = list(pipes.keys())
+    table = _summary_table_from_results(results_by_model, model_order=model_order, metrics=metrics)
+
+    return Section8RunResult(
+        target_col=target_col,
+        n_splits=n_splits,
+        cv_random_state=cv_random_state,
+        split_fingerprint=fp,
+        results_by_model=results_by_model,
+        summary_table=table,
+    )
+
+
+
+%%writefile test_section8_core_modeling.py
+import unittest
+import numpy as np
+import pandas as pd
+
+import section5_preprocessing_pipeline as s5
+import section8_core_modeling as s8
+import section7_validation_protocol as s7
+
+
+class TestSection8CoreModeling(unittest.TestCase):
+    def _toy_diabetes_like_df(self, n: int = 300) -> pd.DataFrame:
+        rng = np.random.RandomState(0)
+
+        # 20% positives, 80% negatives
+        y = np.array([0] * int(n * 0.8) + [1] * (n - int(n * 0.8)), dtype=int)
+        rng.shuffle(y)
+
+        ages = list(s5.AGE_ORDER)
+        df = pd.DataFrame(
+            {
+                "encounter_id": np.arange(n),
+                "patient_nbr": np.arange(10_000, 10_000 + n),
+                "race": rng.choice(["Caucasian", "AfricanAmerican", "Hispanic", "?"], size=n),
+                "gender": rng.choice(["Male", "Female"], size=n),
+                "age": rng.choice(ages, size=n),
+                "weight": rng.choice(["?", "70", "80", "90", "Unknown/Invalid"], size=n),
+                "admission_type_id": rng.choice([1, 2, 6], size=n),
+                "discharge_disposition_id": rng.choice([1, 3, 25], size=n),
+                "admission_source_id": rng.choice([1, 7], size=n),
+                "time_in_hospital": rng.choice([1, 2, 3, 4, 5, 6, 7], size=n),
+                "payer_code": rng.choice(["MC", "MD", "?", "SP"], size=n),
+                "medical_specialty": rng.choice(
+                    ["Cardiology", "InternalMedicine", "?", "RareSpecA", "RareSpecB"], size=n
+                ),
+                "num_lab_procedures": rng.poisson(lam=40, size=n),
+                "num_procedures": rng.poisson(lam=1, size=n),
+                "num_medications": rng.poisson(lam=10, size=n),
+                "number_outpatient": rng.poisson(lam=1, size=n),
+                "number_emergency": rng.poisson(lam=0.2, size=n),
+                "number_inpatient": rng.poisson(lam=0.5, size=n),
+                "diag_1": rng.choice(["250.83", "276", "648", "8", "401"], size=n),
+                "diag_2": rng.choice(["?", "250.01", "403", "V27"], size=n),
+                "diag_3": rng.choice(["?", "7", "9", "6"], size=n),
+                "A1Cresult": rng.choice(["None", "Norm", ">7", ">8", "?"], size=n),
+                "insulin": rng.choice(["No", "Steady", "Up", "Down"], size=n),
+                "change": rng.choice(["Ch", "No"], size=n),
+                "diabetesMed": rng.choice(["Yes", "No"], size=n),
+                "readmitted_30d": y,
+            }
+        )
+        return df
+
+    def test_build_pipelines_contains_two_models(self):
+        df = self._toy_diabetes_like_df(n=50)
+        cfg = s5.DiabetesPreprocessConfig(onehot_sparse=True, rare_min_count=1)
+
+        pipes = s8.build_section8_pipelines(df, preprocess_config=cfg, model_random_state=42)
+        self.assertIn("logistic_regression", pipes)
+        self.assertIn("decision_tree", pipes)
+
+        # Decision tree pipeline should include the CSC converter step
+        self.assertTrue(any(step_name == "to_csc" for step_name, _ in pipes["decision_tree"].steps))
+
+    def test_run_section8_core_models_returns_table_and_identical_folds(self):
+        df = self._toy_diabetes_like_df(n=300)
+        cfg = s5.DiabetesPreprocessConfig(onehot_sparse=True, rare_min_count=1)
+
+        # Create splits once and reuse
+        y = df["readmitted_30d"].astype(int).to_numpy()
+        splits = s7.make_stratified_cv_splits(y, n_splits=5, random_state=123)
+
+        out = s8.run_section8_core_models(
+            df,
+            target_col="readmitted_30d",
+            preprocess_config=cfg,
+            n_splits=5,
+            cv_random_state=123,
+            model_random_state=42,
+            cv_splits=splits,
+            return_oof=True,
+        )
+
+        # Table shape: 2 models
+        self.assertEqual(out.summary_table.shape[0], 2)
+        self.assertIn("roc_auc_mean", out.summary_table.columns)
+        self.assertIn("f1_mean", out.summary_table.columns)
+
+        # Both models must share the exact same folds fingerprint
+        r_lr = out.results_by_model["logistic_regression"]
+        r_dt = out.results_by_model["decision_tree"]
+        self.assertEqual(r_lr.split_fingerprint, r_dt.split_fingerprint)
+        self.assertEqual(r_lr.split_fingerprint, out.split_fingerprint)
+
+        # Fold scores are finite and length = n_splits
+        self.assertEqual(len(r_lr.fold_scores["roc_auc"]), 5)
+        self.assertTrue(np.isfinite(r_lr.fold_scores["roc_auc"]).all())
+        self.assertEqual(len(r_dt.fold_scores["roc_auc"]), 5)
+        self.assertTrue(np.isfinite(r_dt.fold_scores["roc_auc"]).all())
+
+        # OOF vectors exist and cover all rows
+        self.assertEqual(len(r_lr.oof_pred), len(df))
+        self.assertEqual(len(r_lr.oof_score), len(df))
+        self.assertTrue(np.isfinite(r_lr.oof_score).all())
+
+    def test_raises_if_target_missing(self):
+        df = self._toy_diabetes_like_df(n=50).drop(columns=["readmitted_30d"])
+        cfg = s5.DiabetesPreprocessConfig(onehot_sparse=True, rare_min_count=1)
+        with self.assertRaises(KeyError):
+            _ = s8.run_section8_core_models(df, target_col="readmitted_30d", preprocess_config=cfg, n_splits=3)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+
+
+
+
+import section8_core_modeling as s8
+
+out8 = s8.run_section8_core_models(
+    df,
+    target_col="readmitted_30d",
+    preprocess_config=cfg,
+    n_splits=10,
+    cv_random_state=42,
+    model_random_state=42,
+    cv_splits=splits,     # <<< critical: identical folds
+    return_oof=True,      # useful later for error analysis / XAI
+)
+
+out8.split_fingerprint, out8.summary_table
+
+
+
+
+---- SECTION 9 ----
+
+%%writefile section9_expanded_modeling.py
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.decomposition import TruncatedSVD
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.svm import LinearSVC
+from sklearn.tree import DecisionTreeClassifier
+
+import section5_preprocessing_pipeline as s5
+import section7_validation_protocol as s7
+
+Split = s7.Split
+
+
+class SparseToCSC(BaseEstimator, TransformerMixin):
+    """Convert sparse matrices to CSC (tree-based estimators often prefer CSC when input is sparse)."""
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        try:
+            from scipy import sparse
+        except Exception as e:
+            raise RuntimeError(
+                "scipy is required for sparse matrix conversion. Install with: pip install scipy"
+            ) from e
+
+        if sparse.issparse(X):
+            return X.tocsc()
+        return X
+
+
+def _validate_binary_target(y: pd.Series) -> np.ndarray:
+    if y.isna().any():
+        raise ValueError("Target contains missing values; Section 9 requires a clean binary target.")
+    y_arr = np.asarray(pd.Series(y).astype(int).tolist(), dtype=int)
+    uniq = set(np.unique(y_arr).tolist())
+    if not uniq.issubset({0, 1}):
+        raise ValueError(f"Target must be binary in {{0,1}}, found values: {sorted(list(uniq))}")
+    return y_arr
+
+
+def _default_X_y(
+    df: pd.DataFrame,
+    *,
+    target_col: str,
+    preprocess_config: s5.DiabetesPreprocessConfig,
+) -> Tuple[pd.DataFrame, np.ndarray]:
+    if target_col not in df.columns:
+        raise KeyError(f"Target column '{target_col}' not found. Available: {list(df.columns)}")
+
+    y = _validate_binary_target(df[target_col])
+
+    drop_cols = [c for c in preprocess_config.target_cols if c in df.columns]
+    if target_col not in drop_cols:
+        drop_cols.append(target_col)
+
+    X = df.drop(columns=drop_cols, errors="ignore")
+    if X.shape[1] == 0:
+        raise ValueError("No feature columns available after dropping target columns.")
+    return X, y
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    name: str
+    pipeline: Pipeline
+    track: str  # helps your report: scaled / tree / nb_nonneg / svd_dense
+
+
+def _make_configs(
+    base: s5.DiabetesPreprocessConfig,
+) -> Dict[str, s5.DiabetesPreprocessConfig]:
+    """
+    Section 9 allows deterministic preprocessing tracks:
+      - scaled: for scale-sensitive models (SVM, MLP)
+      - tree: for tree-based models (DT, RF) (scaling not required)
+      - nb_nonneg: ensures non-negative features for MultinomialNB:
+          * disables ordinal encoding (age becomes one-hot categorical)
+          * disables numeric scaling
+    """
+    cfg_scaled = replace(base, scale_numeric=True, scaler="standard")
+    cfg_tree = replace(base, scale_numeric=False)
+
+    # IMPORTANT: MultinomialNB requires non-negative inputs.
+    # Our default ordinal encoding can yield -1 for unknowns, so for NB we remove ordinal encoding.
+    cfg_nb = replace(cfg_tree, ordinal_cols={})
+
+    return {"scaled": cfg_scaled, "tree": cfg_tree, "nb_nonneg": cfg_nb}
+
+
+def build_section9_model_specs(
+    df: pd.DataFrame,
+    *,
+    preprocess_config_base: Optional[s5.DiabetesPreprocessConfig] = None,
+    model_random_state: int = 42,
+    svd_components: int = 100,
+    fast_mode: bool = False,
+) -> List[ModelSpec]:
+    """
+    Expanded suite (>=5, includes ensembles):
+      - decision_tree (anchor)
+      - naive_bayes (MultinomialNB; non-negative track)
+      - svm_linear (LinearSVC; margin-based)
+      - mlp_svd (MLP on TruncatedSVD components; avoids densifying huge one-hot)
+      - random_forest (bagging)
+      - gradient_boosting_svd (boosting on SVD components; avoids sparse incompatibility)
+
+    fast_mode reduces compute for unit tests / quick sanity runs.
+    """
+    if preprocess_config_base is None:
+        preprocess_config_base = s5.DiabetesPreprocessConfig()
+
+    cfgs = _make_configs(preprocess_config_base)
+
+    pre_tree = s5.build_preprocessor(df, cfgs["tree"])
+    pre_scaled = s5.build_preprocessor(df, cfgs["scaled"])
+    pre_nb = s5.build_preprocessor(df, cfgs["nb_nonneg"])
+
+    # ---- hyperparameters (safe defaults; tuning belongs in Section 14) ----
+    rf_estimators = 80 if fast_mode else 300
+    gb_estimators = 100 if fast_mode else 200
+    mlp_max_iter = 60 if fast_mode else 200
+    mlp_hidden = (32,) if fast_mode else (64,)
+
+    # ---- pipelines ----
+    dt_pipe = Pipeline(
+        steps=[
+            ("pre", pre_tree),
+            ("to_csc", SparseToCSC()),
+            ("clf", DecisionTreeClassifier(random_state=model_random_state)),
+        ]
+    )
+
+    nb_pipe = Pipeline(
+        steps=[
+            ("pre", pre_nb),
+            ("clf", MultinomialNB(alpha=1.0)),
+        ]
+    )
+
+    svm_pipe = Pipeline(
+        steps=[
+            ("pre", pre_scaled),
+            ("clf", LinearSVC(C=1.0, random_state=model_random_state)),
+        ]
+    )
+
+    # MLP cannot consume sparse one-hot reliably; we compress sparse -> dense with TruncatedSVD.
+    mlp_pipe = Pipeline(
+        steps=[
+            ("pre", pre_scaled),
+            ("svd", TruncatedSVD(n_components=int(svd_components), random_state=model_random_state)),
+            ("clf", MLPClassifier(
+                hidden_layer_sizes=mlp_hidden,
+                activation="relu",
+                solver="adam",
+                alpha=1e-4,
+                max_iter=int(mlp_max_iter),
+                random_state=model_random_state,
+                early_stopping=True,
+                n_iter_no_change=10,
+            )),
+        ]
+    )
+
+    rf_pipe = Pipeline(
+        steps=[
+            ("pre", pre_tree),
+            ("to_csc", SparseToCSC()),
+            ("clf", RandomForestClassifier(
+                n_estimators=int(rf_estimators),
+                random_state=model_random_state,
+                n_jobs=-1,
+            )),
+        ]
+    )
+
+    # GradientBoostingClassifier does not accept sparse matrices; we again use SVD to get dense components.
+    gb_pipe = Pipeline(
+        steps=[
+            ("pre", pre_tree),
+            ("svd", TruncatedSVD(n_components=int(svd_components), random_state=model_random_state)),
+            ("clf", GradientBoostingClassifier(
+                n_estimators=int(gb_estimators),
+                learning_rate=0.1,
+                random_state=model_random_state,
+            )),
+        ]
+    )
+
+    return [
+        ModelSpec("decision_tree", dt_pipe, track="tree"),
+        ModelSpec("naive_bayes", nb_pipe, track="nb_nonneg"),
+        ModelSpec("svm_linear", svm_pipe, track="scaled"),
+        ModelSpec("mlp_svd", mlp_pipe, track="svd_dense"),
+        ModelSpec("random_forest", rf_pipe, track="tree"),
+        ModelSpec("gradient_boosting_svd", gb_pipe, track="svd_dense"),
+    ]
+
+
+@dataclass(frozen=True)
+class Section9RunResult:
+    target_col: str
+    n_splits: int
+    cv_random_state: int
+    split_fingerprint: str
+    results_by_model: Dict[str, s7.CVEvaluationResult]
+    summary_table: pd.DataFrame
+
+
+def _summary_table(
+    specs: Sequence[ModelSpec],
+    results_by_model: Dict[str, s7.CVEvaluationResult],
+    *,
+    metrics: Sequence[str],
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for spec in specs:
+        r = results_by_model[spec.name]
+        row: Dict[str, Any] = {"model": spec.name, "track": spec.track}
+        for m in metrics:
+            row[f"{m}_mean"] = float(r.mean_scores[m])
+            row[f"{m}_std"] = float(r.std_scores[m])
+        rows.append(row)
+
+    cols = ["model", "track"] + [f"{m}_{s}" for m in metrics for s in ("mean", "std")]
+    return pd.DataFrame(rows)[cols]
+
+
+def run_section9_expanded_suite(
+    df: pd.DataFrame,
+    *,
+    target_col: str = "readmitted_30d",
+    preprocess_config_base: Optional[s5.DiabetesPreprocessConfig] = None,
+    n_splits: int = 10,
+    cv_random_state: int = 42,
+    model_random_state: int = 42,
+    metrics: Sequence[str] = ("roc_auc", "precision", "recall", "f1", "accuracy", "balanced_accuracy"),
+    return_oof: bool = False,
+    cv_splits: Optional[Sequence[Split]] = None,
+    svd_components: int = 100,
+    fast_mode: bool = False,
+) -> Section9RunResult:
+    """
+    End-to-end Section 9:
+      - builds 6-model suite (>=5, includes ensembles)
+      - uses identical StratifiedKFold splits (must be reused across comparisons)
+      - reports mean ± std across folds (table-ready)
+
+    IMPORTANT: For Wilcoxon later, pass the SAME cv_splits you used elsewhere.
+    """
+    if preprocess_config_base is None:
+        preprocess_config_base = s5.DiabetesPreprocessConfig()
+
+    X, y = _default_X_y(df, target_col=target_col, preprocess_config=preprocess_config_base)
+
+    if cv_splits is None:
+        cv_splits = s7.make_stratified_cv_splits(y, n_splits=n_splits, random_state=cv_random_state)
+    else:
+        s7.validate_cv_splits(cv_splits, n_samples=len(y), n_splits_expected=n_splits)
+
+    fp = s7.cv_splits_fingerprint(cv_splits)
+
+    specs = build_section9_model_specs(
+        df,
+        preprocess_config_base=preprocess_config_base,
+        model_random_state=model_random_state,
+        svd_components=svd_components,
+        fast_mode=fast_mode,
+    )
+
+    results_by_model: Dict[str, s7.CVEvaluationResult] = {}
+    for spec in specs:
+        res = s7.evaluate_binary_pipeline_cv(
+            spec.pipeline,
+            X,
+            y,
+            cv_splits=cv_splits,
+            metrics=metrics,
+            return_oof=return_oof,
+        )
+        results_by_model[spec.name] = res
+
+    table = _summary_table(specs, results_by_model, metrics=metrics)
+
+    return Section9RunResult(
+        target_col=target_col,
+        n_splits=n_splits,
+        cv_random_state=cv_random_state,
+        split_fingerprint=fp,
+        results_by_model=results_by_model,
+        summary_table=table,
+    )
+
+
+
+%%writefile test_section9_expanded_modeling.py
+import unittest
+import numpy as np
+import pandas as pd
+
+import section5_preprocessing_pipeline as s5
+import section7_validation_protocol as s7
+import section9_expanded_modeling as s9
+
+
+class TestSection9ExpandedModeling(unittest.TestCase):
+    def _toy_diabetes_like_df(self, n: int = 260) -> pd.DataFrame:
+        rng = np.random.RandomState(0)
+
+        # 20% positives, 80% negatives (enough for stratified folds)
+        y = np.array([0] * int(n * 0.8) + [1] * (n - int(n * 0.8)), dtype=int)
+        rng.shuffle(y)
+
+        ages = list(s5.AGE_ORDER)
+        df = pd.DataFrame(
+            {
+                "encounter_id": np.arange(n),
+                "patient_nbr": np.arange(10_000, 10_000 + n),
+                "race": rng.choice(["Caucasian", "AfricanAmerican", "Hispanic", "?"], size=n),
+                "gender": rng.choice(["Male", "Female"], size=n),
+                "age": rng.choice(ages + ["?"], size=n),
+                "weight": rng.choice(["?", "70", "80", "90", "Unknown/Invalid"], size=n),
+                "admission_type_id": rng.choice([1, 2, 6], size=n),
+                "discharge_disposition_id": rng.choice([1, 3, 25], size=n),
+                "admission_source_id": rng.choice([1, 7], size=n),
+                "time_in_hospital": rng.choice([1, 2, 3, 4, 5, 6, 7], size=n),
+                "payer_code": rng.choice(["MC", "MD", "?", "SP"], size=n),
+                "medical_specialty": rng.choice(
+                    ["Cardiology", "InternalMedicine", "?", "RareSpecA", "RareSpecB"], size=n
+                ),
+                "num_lab_procedures": rng.poisson(lam=40, size=n),
+                "num_procedures": rng.poisson(lam=1, size=n),
+                "num_medications": rng.poisson(lam=10, size=n),
+                "number_outpatient": rng.poisson(lam=1, size=n),
+                "number_emergency": rng.poisson(lam=0.2, size=n),
+                "number_inpatient": rng.poisson(lam=0.5, size=n),
+                "diag_1": rng.choice(["250.83", "276", "648", "8", "401"], size=n),
+                "diag_2": rng.choice(["?", "250.01", "403", "V27"], size=n),
+                "diag_3": rng.choice(["?", "7", "9", "6"], size=n),
+                "A1Cresult": rng.choice(["None", "Norm", ">7", ">8", "?"], size=n),
+                "insulin": rng.choice(["No", "Steady", "Up", "Down"], size=n),
+                "change": rng.choice(["Ch", "No"], size=n),
+                "diabetesMed": rng.choice(["Yes", "No"], size=n),
+                "readmitted_30d": y,
+            }
+        )
+        return df
+
+    def test_build_model_specs_contains_six_models(self):
+        df = self._toy_diabetes_like_df(n=120)
+        cfg = s5.DiabetesPreprocessConfig(onehot_sparse=True, rare_min_count=1)
+
+        specs = s9.build_section9_model_specs(
+            df,
+            preprocess_config_base=cfg,
+            model_random_state=0,
+            svd_components=10,
+            fast_mode=True,
+        )
+        names = [s.name for s in specs]
+        self.assertEqual(len(names), 6)
+        for must in [
+            "decision_tree",
+            "naive_bayes",
+            "svm_linear",
+            "mlp_svd",
+            "random_forest",
+            "gradient_boosting_svd",
+        ]:
+            self.assertIn(must, names)
+
+    def test_run_section9_produces_table_and_identical_folds(self):
+        df = self._toy_diabetes_like_df(n=260)
+        cfg = s5.DiabetesPreprocessConfig(onehot_sparse=True, rare_min_count=1)
+
+        y = df["readmitted_30d"].astype(int).to_numpy()
+        splits = s7.make_stratified_cv_splits(y, n_splits=5, random_state=123)
+
+        out = s9.run_section9_expanded_suite(
+            df,
+            target_col="readmitted_30d",
+            preprocess_config_base=cfg,
+            n_splits=5,
+            cv_random_state=123,
+            model_random_state=0,
+            cv_splits=splits,
+            svd_components=10,
+            fast_mode=True,
+            return_oof=False,
+        )
+
+        # 6 models in the summary table
+        self.assertEqual(out.summary_table.shape[0], 6)
+        self.assertIn("roc_auc_mean", out.summary_table.columns)
+        self.assertIn("f1_mean", out.summary_table.columns)
+
+        # All models share the same fold fingerprint
+        fps = set()
+        for name, res in out.results_by_model.items():
+            fps.add(res.split_fingerprint)
+            self.assertEqual(len(res.fold_scores["roc_auc"]), 5)
+            self.assertTrue(np.isfinite(res.fold_scores["roc_auc"]).all())
+        self.assertEqual(len(fps), 1)
+        self.assertEqual(out.split_fingerprint, list(fps)[0])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
 
