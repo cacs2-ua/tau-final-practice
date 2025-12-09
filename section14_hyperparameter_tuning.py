@@ -1,35 +1,45 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from dataclasses import replace as dc_replace
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union, Literal
+from collections import Counter
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Literal
 
 import numpy as np
 import pandas as pd
 
-from sklearn.base import clone
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
+from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.model_selection import GridSearchCV, RandomizedSearchCV, StratifiedKFold
 from sklearn.pipeline import Pipeline
+from sklearn.metrics import (
+    roc_auc_score,
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    balanced_accuracy_score,
+)
 
 import section5_preprocessing_pipeline as s5
 import section7_validation_protocol as s7
 
 Split = s7.Split
 
-TuneMode = Literal["manual", "grid", "random", "nested_grid", "nested_random"]
-
 
 # -----------------------------
-# Small utilities (consistent with Section 7 contract)
+# Small helpers
 # -----------------------------
+class SparseToCSC(BaseEstimator, TransformerMixin):
+    """Convert sparse matrices to CSC (helps some tree models)."""
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        try:
+            from scipy import sparse
+        except Exception as e:
+            raise RuntimeError("scipy is required. Install with: pip install scipy") from e
+        return X.tocsc() if sparse.issparse(X) else X
+
 
 def _safe_index(X, idx: np.ndarray):
     if isinstance(X, (pd.DataFrame, pd.Series)):
@@ -37,55 +47,24 @@ def _safe_index(X, idx: np.ndarray):
     return X[idx]
 
 
-def _ensure_binary_1d(y: Iterable[int]) -> np.ndarray:
-    y_arr = np.asarray(list(y), dtype=int).ravel()
-    if y_arr.size == 0:
-        raise ValueError("y is empty.")
-    uniq = set(np.unique(y_arr).tolist())
-    if not uniq.issubset({0, 1}):
-        raise ValueError(f"y must be binary in {{0,1}}. Found: {sorted(list(uniq))}")
-    return y_arr
-
-
-def _get_score_vector(estimator, X, *, positive_label: int = 1) -> np.ndarray:
-    """
-    Continuous scores for ROC-AUC:
-    - predict_proba[:, pos] if available
-    - else decision_function if available
-    """
+def _score_vector(estimator, X, *, positive_label: int = 1) -> np.ndarray:
+    # AUC needs continuous scores
     if hasattr(estimator, "predict_proba"):
         proba = np.asarray(estimator.predict_proba(X))
         if proba.ndim != 2 or proba.shape[1] < 2:
-            raise ValueError("predict_proba must return [n_samples, 2+] for binary ROC-AUC.")
+            raise ValueError("predict_proba must return [n_samples, 2+] for binary AUC.")
         classes = getattr(estimator, "classes_", None)
         if classes is None:
             pos_idx = 1
         else:
             classes = np.asarray(classes)
-            if positive_label in set(classes.tolist()):
-                pos_idx = int(np.where(classes == positive_label)[0][0])
-            else:
-                pos_idx = 1
+            pos_idx = int(np.where(classes == positive_label)[0][0]) if positive_label in set(classes.tolist()) else 1
         return proba[:, pos_idx].astype(float)
 
     if hasattr(estimator, "decision_function"):
-        s = estimator.decision_function(X)
-        return np.asarray(s, dtype=float).ravel()
+        return np.asarray(estimator.decision_function(X), dtype=float).ravel()
 
     raise ValueError("Estimator must expose predict_proba or decision_function for ROC-AUC.")
-
-
-class SparseToCSC:
-    """Convert sparse matrices to CSC (tree-based estimators often prefer CSC)."""
-
-    def fit(self, X, y=None):
-        return self
-
-    def transform(self, X):
-        from scipy import sparse
-        if sparse.issparse(X):
-            return X.tocsc()
-        return X
 
 
 def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_score: np.ndarray) -> Dict[str, float]:
@@ -99,509 +78,315 @@ def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_score: np.ndarray
     }
 
 
-# -----------------------------
-# Pipeline builders (tunable)
-# -----------------------------
-
-TunableModel = Literal[
-    "logistic_regression",
-    "random_forest",
-    "linear_svm",
-    "gradient_boosting_svd",
-]
-
-
-def _make_preprocess_variants(
-    base: s5.DiabetesPreprocessConfig,
-) -> Dict[str, s5.DiabetesPreprocessConfig]:
-    """
-    Deterministic preprocessing variants:
-    - scaled: for scale-sensitive models (LR, SVM)
-    - tree:   for tree models (no scaling needed)
-    """
-    cfg_scaled = dc_replace(base, scale_numeric=True, scaler="standard")
-    cfg_tree = dc_replace(base, scale_numeric=False)
-    return {"scaled": cfg_scaled, "tree": cfg_tree}
-
-
-def build_tunable_pipeline(
+def default_X_y(
     df: pd.DataFrame,
     *,
-    model: TunableModel,
-    preprocess_config_base: Optional[s5.DiabetesPreprocessConfig] = None,
-    model_random_state: int = 42,
-    svd_components: int = 100,
-    fast_mode: bool = False,
-) -> Pipeline:
+    target_col: str,
+    preprocess_config: s5.DiabetesPreprocessConfig,
+) -> Tuple[pd.DataFrame, np.ndarray]:
+    if target_col not in df.columns:
+        raise KeyError(f"Target column '{target_col}' not found in df.")
+    y = df[target_col].astype(int).to_numpy()
+    drop_cols = [c for c in preprocess_config.target_cols if c in df.columns]
+    if target_col not in drop_cols:
+        drop_cols.append(target_col)
+    X = df.drop(columns=drop_cols, errors="ignore")
+    if X.shape[1] == 0:
+        raise ValueError("No features left after dropping target columns.")
+    return X, y
+
+
+# -----------------------------
+# (A) Manual sweep (simple & rubric-safe)
+# -----------------------------
+def manual_sweep_logreg_C(
+    df: pd.DataFrame,
+    *,
+    target_col: str = "readmitted_30d",
+    preprocess_config: Optional[s5.DiabetesPreprocessConfig] = None,
+    cv_splits: Sequence[Split],
+    C_values: Sequence[float] = (0.01, 0.1, 1.0, 3.0, 10.0),
+    class_weight: Optional[str] = None,  # None or "balanced"
+    random_state: int = 42,
+) -> pd.DataFrame:
     """
-    Build a single sklearn Pipeline = [preprocessing] (+ adapters) + [classifier]
-    to be tuned with manual/grid/random/nested CV.
-
-    NOTE: Preprocessing is inside the pipeline => no leakage during CV/search.
+    Evaluate LogisticRegression for several C values on the SAME fixed outer folds.
+    This is exactly the "manual hyperparameter exploration" objective.
     """
-    if preprocess_config_base is None:
-        preprocess_config_base = s5.DiabetesPreprocessConfig()
+    if preprocess_config is None:
+        preprocess_config = s5.DiabetesPreprocessConfig(scale_numeric=True, scaler="standard")
 
-    cfgs = _make_preprocess_variants(preprocess_config_base)
+    X, y = default_X_y(df, target_col=target_col, preprocess_config=preprocess_config)
+    s7.validate_cv_splits(cv_splits, n_samples=len(y))
 
-    model = str(model).strip().lower()
-    if model == "logistic_regression":
-        from sklearn.linear_model import LogisticRegression
-        pre = s5.build_preprocessor(df, cfgs["scaled"])
-        max_iter = 300 if fast_mode else 2000
-        clf = LogisticRegression(
-            solver="saga",
-            penalty="l2",
-            C=1.0,
-            max_iter=int(max_iter),
-            random_state=int(model_random_state),
-            n_jobs=-1,
-        )
-        return Pipeline(steps=[("pre", pre), ("clf", clf)])
+    from sklearn.linear_model import LogisticRegression
 
-    if model == "random_forest":
-        from sklearn.ensemble import RandomForestClassifier
-        pre = s5.build_preprocessor(df, cfgs["tree"])
-        n_estimators = 80 if fast_mode else 300
-        clf = RandomForestClassifier(
-            n_estimators=int(n_estimators),
-            random_state=int(model_random_state),
-            n_jobs=-1,
-        )
-        return Pipeline(steps=[("pre", pre), ("to_csc", SparseToCSC()), ("clf", clf)])
+    pre = s5.build_preprocessor(df, preprocess_config)
 
-    if model == "linear_svm":
-        from sklearn.svm import LinearSVC
-        pre = s5.build_preprocessor(df, cfgs["scaled"])
-        clf = LinearSVC(C=1.0, random_state=int(model_random_state))
-        return Pipeline(steps=[("pre", pre), ("clf", clf)])
-
-    if model == "gradient_boosting_svd":
-        from sklearn.decomposition import TruncatedSVD
-        from sklearn.ensemble import GradientBoostingClassifier
-        pre = s5.build_preprocessor(df, cfgs["tree"])
-        n_estimators = 80 if fast_mode else 200
-        clf = GradientBoostingClassifier(
-            n_estimators=int(n_estimators),
-            learning_rate=0.1,
-            random_state=int(model_random_state),
-        )
-        return Pipeline(
+    rows: List[Dict[str, Any]] = []
+    for C in C_values:
+        pipe = Pipeline(
             steps=[
                 ("pre", pre),
-                ("svd", TruncatedSVD(n_components=int(svd_components), random_state=int(model_random_state))),
-                ("clf", clf),
+                ("clf", LogisticRegression(
+                    solver="saga",
+                    penalty="l2",
+                    C=float(C),
+                    class_weight=class_weight,
+                    max_iter=4000,
+                    n_jobs=-1,
+                    random_state=int(random_state),
+                )),
             ]
         )
 
-    raise ValueError(f"Unknown model '{model}'. Allowed: logistic_regression, random_forest, linear_svm, gradient_boosting_svd.")
-
-
-def default_param_search_space(
-    model: TunableModel,
-    *,
-    fast_mode: bool = False,
-) -> Union[Dict[str, List[Any]], Dict[str, Any]]:
-    """
-    Ready-to-use search spaces (reasonable, rubric-safe).
-    Keys use the Pipeline prefix 'clf__'.
-
-    You can override these in your notebook when you want more extensive tuning.
-    """
-    model = str(model).strip().lower()
-
-    if model == "logistic_regression":
-        Cs = [0.1, 1.0, 3.0] if fast_mode else [0.01, 0.1, 1.0, 3.0, 10.0]
-        return {"clf__C": Cs}
-
-    if model == "random_forest":
-        if fast_mode:
-            return {
-                "clf__max_depth": [None, 8],
-                "clf__min_samples_leaf": [1, 5],
-                "clf__max_features": ["sqrt"],
-            }
-        return {
-            "clf__max_depth": [None, 8, 16],
-            "clf__min_samples_leaf": [1, 5, 10],
-            "clf__max_features": ["sqrt", "log2"],
-        }
-
-    if model == "linear_svm":
-        Cs = [0.1, 1.0, 3.0] if fast_mode else [0.01, 0.1, 1.0, 3.0, 10.0]
-        return {"clf__C": Cs}
-
-    if model == "gradient_boosting_svd":
-        if fast_mode:
-            return {"clf__learning_rate": [0.05, 0.1], "clf__max_depth": [2, 3]}
-        return {"clf__learning_rate": [0.03, 0.05, 0.1], "clf__max_depth": [2, 3, 4]}
-
-    raise ValueError(f"Unknown model '{model}'.")
-
-
-# -----------------------------
-# Manual sweep (Basic requirement)
-# -----------------------------
-
-@dataclass(frozen=True)
-class ManualSweepResult:
-    mode: TuneMode
-    split_fingerprint: str
-    metric_refit: str
-    results_table: pd.DataFrame
-    best_params: Dict[str, Any]
-    best_score: float
-
-
-def manual_hyperparameter_sweep(
-    pipeline: Pipeline,
-    X,
-    y: Iterable[int],
-    *,
-    cv_splits: Sequence[Split],
-    param_list: Sequence[Dict[str, Any]],
-    metrics: Sequence[str] = ("roc_auc", "precision", "recall", "f1", "accuracy", "balanced_accuracy"),
-    refit_metric: str = "roc_auc",
-) -> ManualSweepResult:
-    """
-    Manual exploration:
-      - evaluate each params dict using the SAME fixed splits (Section 7 contract)
-      - produce mean±std table
-      - pick best by refit_metric mean
-    """
-    y_arr = _ensure_binary_1d(y)
-    s7.validate_cv_splits(cv_splits, n_samples=len(y_arr))
-    fp = s7.cv_splits_fingerprint(cv_splits)
-
-    rows: List[Dict[str, Any]] = []
-    best_score = -np.inf
-    best_params: Dict[str, Any] = {}
-
-    for i, params in enumerate(param_list):
-        pipe_i = clone(pipeline).set_params(**params)
-
         res = s7.evaluate_binary_pipeline_cv(
-            pipe_i,
-            X,
-            y_arr,
+            pipe, X, y,
             cv_splits=cv_splits,
-            metrics=metrics,
+            metrics=("roc_auc","precision","recall","f1","accuracy","balanced_accuracy"),
             return_oof=False,
         )
+        rows.append({
+            "model": "logreg",
+            "C": float(C),
+            "class_weight": (class_weight if class_weight is not None else "None"),
+            **{f"{m}_mean": float(res.mean_scores[m]) for m in res.mean_scores},
+            **{f"{m}_std": float(res.std_scores[m]) for m in res.std_scores},
+        })
 
-        row: Dict[str, Any] = {"trial": int(i)}
-        for k, v in params.items():
-            row[k] = v
-
-        for m in metrics:
-            row[f"{m}_mean"] = float(res.mean_scores[m])
-            row[f"{m}_std"] = float(res.std_scores[m])
-
-        rows.append(row)
-
-        score_i = float(row[f"{refit_metric}_mean"])
-        if score_i > best_score:
-            best_score = score_i
-            best_params = dict(params)
-
-    table = pd.DataFrame(rows).sort_values(f"{refit_metric}_mean", ascending=False).reset_index(drop=True)
-
-    return ManualSweepResult(
-        mode="manual",
-        split_fingerprint=fp,
-        metric_refit=refit_metric,
-        results_table=table,
-        best_params=best_params,
-        best_score=float(best_score),
-    )
+    out = pd.DataFrame(rows).sort_values("roc_auc_mean", ascending=False).reset_index(drop=True)
+    return out
 
 
 # -----------------------------
-# Automated search (Advanced requirement)
+# (B) Automated tuning (Grid / Random)
+# NOTE: This chooses hyperparams using CV on the SAME data;
+# use (C) Nested CV for unbiased performance estimates.
 # -----------------------------
-
-@dataclass(frozen=True)
-class SearchCVResult:
-    mode: TuneMode
-    split_fingerprint: str
-    metric_refit: str
-    best_params: Dict[str, Any]
-    best_score: float
-    cv_results_table: pd.DataFrame
-    best_estimator: Any
-
-
-def grid_search_fixed_splits(
-    pipeline: Pipeline,
-    X,
-    y: Iterable[int],
+def gridsearch_logreg(
+    df: pd.DataFrame,
     *,
-    cv_splits: Sequence[Split],
-    param_grid: Dict[str, List[Any]],
-    scoring: str = "roc_auc",
-    n_jobs: Optional[int] = None,
-    refit: bool = True,
-    error_score: Union[str, float] = "raise",
-) -> SearchCVResult:
-    """
-    GridSearchCV using the SAME fixed splits (identical folds across comparisons).
-    NOTE: this is not nested; use nested_cv_* for unbiased performance.
-    """
-    y_arr = _ensure_binary_1d(y)
-    s7.validate_cv_splits(cv_splits, n_samples=len(y_arr))
-    fp = s7.cv_splits_fingerprint(cv_splits)
-
-    gscv = GridSearchCV(
-        estimator=pipeline,
-        param_grid=param_grid,
-        scoring=scoring,
-        cv=list(cv_splits),
-        refit=refit,
-        n_jobs=n_jobs,
-        error_score=error_score,
-        return_train_score=False,
-    )
-    gscv.fit(X, y_arr)
-
-    tbl = pd.DataFrame(gscv.cv_results_).sort_values("rank_test_score").reset_index(drop=True)
-
-    return SearchCVResult(
-        mode="grid",
-        split_fingerprint=fp,
-        metric_refit=scoring,
-        best_params=dict(gscv.best_params_),
-        best_score=float(gscv.best_score_),
-        cv_results_table=tbl,
-        best_estimator=gscv.best_estimator_,
-    )
-
-
-def random_search_fixed_splits(
-    pipeline: Pipeline,
-    X,
-    y: Iterable[int],
-    *,
-    cv_splits: Sequence[Split],
-    param_distributions: Dict[str, Any],
-    n_iter: int = 20,
-    scoring: str = "roc_auc",
+    target_col: str = "readmitted_30d",
+    preprocess_config: Optional[s5.DiabetesPreprocessConfig] = None,
+    inner_folds: int = 5,
     random_state: int = 42,
-    n_jobs: Optional[int] = None,
-    refit: bool = True,
-    error_score: Union[str, float] = "raise",
-) -> SearchCVResult:
-    """
-    RandomizedSearchCV using the SAME fixed splits.
-    NOTE: this is not nested; use nested_cv_* for unbiased performance.
-    """
-    y_arr = _ensure_binary_1d(y)
-    s7.validate_cv_splits(cv_splits, n_samples=len(y_arr))
-    fp = s7.cv_splits_fingerprint(cv_splits)
+    n_jobs: int = -1,
+    verbose: int = 1,
+):
+    if preprocess_config is None:
+        preprocess_config = s5.DiabetesPreprocessConfig(scale_numeric=True, scaler="standard")
 
-    rscv = RandomizedSearchCV(
-        estimator=pipeline,
-        param_distributions=param_distributions,
-        n_iter=int(n_iter),
-        scoring=scoring,
-        cv=list(cv_splits),
-        refit=refit,
-        random_state=int(random_state),
-        n_jobs=n_jobs,
-        error_score=error_score,
+    X, y = default_X_y(df, target_col=target_col, preprocess_config=preprocess_config)
+    from sklearn.linear_model import LogisticRegression
+
+    pre = s5.build_preprocessor(df, preprocess_config)
+
+    pipe = Pipeline(
+        steps=[
+            ("pre", pre),
+            ("clf", LogisticRegression(
+                solver="saga",
+                max_iter=5000,
+                n_jobs=-1,
+                random_state=int(random_state),
+            )),
+        ]
+    )
+
+    # Use list-of-dicts to avoid invalid combos
+    param_grid = [
+        {"clf__penalty": ["l2"], "clf__C": [0.01, 0.1, 1.0, 3.0, 10.0], "clf__class_weight": [None, "balanced"]},
+        {"clf__penalty": ["l1"], "clf__C": [0.01, 0.1, 1.0, 3.0, 10.0], "clf__class_weight": [None, "balanced"]},
+    ]
+
+    inner_cv = StratifiedKFold(n_splits=int(inner_folds), shuffle=True, random_state=int(random_state))
+
+    gs = GridSearchCV(
+        estimator=pipe,
+        param_grid=param_grid,
+        scoring="roc_auc",
+        refit=True,
+        cv=inner_cv,
+        n_jobs=int(n_jobs),
+        verbose=int(verbose),
         return_train_score=False,
     )
-    rscv.fit(X, y_arr)
-
-    tbl = pd.DataFrame(rscv.cv_results_).sort_values("rank_test_score").reset_index(drop=True)
-
-    return SearchCVResult(
-        mode="random",
-        split_fingerprint=fp,
-        metric_refit=scoring,
-        best_params=dict(rscv.best_params_),
-        best_score=float(rscv.best_score_),
-        cv_results_table=tbl,
-        best_estimator=rscv.best_estimator_,
-    )
+    gs.fit(X, y)
+    return gs
 
 
 # -----------------------------
-# Nested CV (Top-grade requirement)
+# (C) Nested CV (top grade methodology)
+# Outer folds = your FIXED splits from Section 7
+# Inner = GridSearchCV or RandomizedSearchCV on TRAIN only
 # -----------------------------
+SearchKind = Literal["grid", "random"]
+
 
 @dataclass(frozen=True)
 class NestedCVResult:
-    mode: TuneMode
+    model_name: str
     outer_split_fingerprint: str
-    inner_n_splits: int
-    scoring: str
-    outer_fold_scores: np.ndarray
-    mean_score: float
-    std_score: float
-    outer_metrics_mean: Dict[str, float]
-    outer_metrics_std: Dict[str, float]
+    fold_metrics: pd.DataFrame
+    mean_scores: Dict[str, float]
+    std_scores: Dict[str, float]
     best_params_per_fold: List[Dict[str, Any]]
+    best_params_counts: List[Tuple[str, int]]
 
 
-def nested_cv_grid_search(
-    pipeline: Pipeline,
-    X,
-    y: Iterable[int],
+def nested_cv_tuning(
+    df: pd.DataFrame,
     *,
+    model_name: Literal["logreg","random_forest"] = "logreg",
+    target_col: str = "readmitted_30d",
+    preprocess_config: Optional[s5.DiabetesPreprocessConfig] = None,
     outer_splits: Sequence[Split],
-    param_grid: Dict[str, List[Any]],
-    scoring: str = "roc_auc",
-    inner_n_splits: int = 5,
-    inner_random_state: int = 123,
-    n_jobs: Optional[int] = None,
+    inner_folds: int = 3,
+    search: SearchKind = "random",
+    n_iter: int = 20,                # only used for RandomizedSearchCV
+    random_state: int = 42,
+    n_jobs: int = -1,
+    verbose: int = 0,
 ) -> NestedCVResult:
-    """
-    Nested CV:
-      - Outer folds: fixed (identical across model comparisons)
-      - Inner loop: GridSearchCV only on training split
-      - Report unbiased outer-fold performance of the tuned model
-    """
-    y_arr = _ensure_binary_1d(y)
-    s7.validate_cv_splits(outer_splits, n_samples=len(y_arr))
+    if preprocess_config is None:
+        preprocess_config = s5.DiabetesPreprocessConfig()
+
+    X, y = default_X_y(df, target_col=target_col, preprocess_config=preprocess_config)
+    s7.validate_cv_splits(outer_splits, n_samples=len(y))
     fp_outer = s7.cv_splits_fingerprint(outer_splits)
 
-    outer_scores: List[float] = []
-    outer_metrics: Dict[str, List[float]] = {k: [] for k in ["roc_auc", "precision", "recall", "f1", "accuracy", "balanced_accuracy"]}
-    best_params_per_fold: List[Dict[str, Any]] = []
+    inner_cv = StratifiedKFold(n_splits=int(inner_folds), shuffle=True, random_state=int(random_state))
 
-    for fold_i, (tr, te) in enumerate(outer_splits):
+    # Build pipeline + search space
+    if model_name == "logreg":
+        from sklearn.linear_model import LogisticRegression
+        cfg = preprocess_config
+        # Logistic typically benefits from scaling
+        if not cfg.scale_numeric:
+            cfg = s5.DiabetesPreprocessConfig(**{**cfg.__dict__, "scale_numeric": True, "scaler": "standard"})  # type: ignore
+
+        pre = s5.build_preprocessor(df, cfg)
+        base = Pipeline([
+            ("pre", pre),
+            ("clf", LogisticRegression(
+                solver="saga",
+                max_iter=5000,
+                n_jobs=-1,
+                random_state=int(random_state),
+            )),
+        ])
+        param_grid = [
+            {"clf__penalty": ["l2"], "clf__C": [0.001,0.01,0.1,1,3,10], "clf__class_weight": [None,"balanced"]},
+            {"clf__penalty": ["l1"], "clf__C": [0.001,0.01,0.1,1,3,10], "clf__class_weight": [None,"balanced"]},
+        ]
+        param_dist = {
+            "clf__penalty": ["l2","l1"],
+            "clf__C": list(np.logspace(-3, 1, 20)),
+            "clf__class_weight": [None, "balanced"],
+        }
+
+    elif model_name == "random_forest":
+        from sklearn.ensemble import RandomForestClassifier
+        cfg = preprocess_config
+        # Trees don't need scaling; keep as-is (often faster)
+        pre = s5.build_preprocessor(df, cfg)
+        base = Pipeline([
+            ("pre", pre),
+            ("to_csc", SparseToCSC()),
+            ("clf", RandomForestClassifier(
+                n_estimators=300,
+                n_jobs=-1,
+                random_state=int(random_state),
+            )),
+        ])
+        param_grid = {
+            "clf__n_estimators": [200, 400],
+            "clf__max_depth": [None, 10, 20],
+            "clf__min_samples_split": [2, 10],
+            "clf__min_samples_leaf": [1, 5],
+            "clf__max_features": ["sqrt", 0.3],
+            "clf__class_weight": [None, "balanced", "balanced_subsample"],
+        }
+        param_dist = {
+            "clf__n_estimators": [200, 300, 400, 600],
+            "clf__max_depth": [None, 8, 12, 18, 25],
+            "clf__min_samples_split": [2, 5, 10, 20],
+            "clf__min_samples_leaf": [1, 2, 5, 10],
+            "clf__max_features": ["sqrt", 0.2, 0.3, 0.5],
+            "clf__class_weight": [None, "balanced", "balanced_subsample"],
+        }
+
+    else:
+        raise ValueError("model_name must be 'logreg' or 'random_forest'")
+
+    fold_rows: List[Dict[str, Any]] = []
+    best_params: List[Dict[str, Any]] = []
+
+    for fold_id, (tr, te) in enumerate(outer_splits, start=1):
         tr = np.asarray(tr, dtype=np.int64)
         te = np.asarray(te, dtype=np.int64)
 
-        X_tr = _safe_index(X, tr)
-        y_tr = y_arr[tr]
-        X_te = _safe_index(X, te)
-        y_te = y_arr[te]
+        X_tr, y_tr = _safe_index(X, tr), y[tr]
+        X_te, y_te = _safe_index(X, te), y[te]
 
-        inner_cv = StratifiedKFold(
-            n_splits=int(inner_n_splits),
-            shuffle=True,
-            random_state=int(inner_random_state + fold_i),
-        )
+        if search == "grid":
+            searcher = GridSearchCV(
+                estimator=base,
+                param_grid=param_grid,
+                scoring="roc_auc",
+                refit=True,
+                cv=inner_cv,
+                n_jobs=int(n_jobs),
+                verbose=int(verbose),
+                return_train_score=False,
+            )
+        else:
+            searcher = RandomizedSearchCV(
+                estimator=base,
+                param_distributions=param_dist,
+                n_iter=int(n_iter),
+                scoring="roc_auc",
+                refit=True,
+                cv=inner_cv,
+                random_state=int(random_state),
+                n_jobs=int(n_jobs),
+                verbose=int(verbose),
+                return_train_score=False,
+            )
 
-        gs = GridSearchCV(
-            estimator=clone(pipeline),
-            param_grid=param_grid,
-            scoring=scoring,
-            cv=inner_cv,
-            refit=True,
-            n_jobs=n_jobs,
-            error_score="raise",
-            return_train_score=False,
-        )
-        gs.fit(X_tr, y_tr)
+        searcher.fit(X_tr, y_tr)
+        best_est = searcher.best_estimator_
+        best_params.append(dict(searcher.best_params_))
 
-        best_params_per_fold.append(dict(gs.best_params_))
-
-        best_est = gs.best_estimator_
+        # Evaluate on OUTER test fold
         y_pred = np.asarray(best_est.predict(X_te), dtype=int)
-        y_score = _get_score_vector(best_est, X_te, positive_label=1)
-
+        y_score = _score_vector(best_est, X_te, positive_label=1)
         m = _compute_metrics(y_te, y_pred, y_score)
-        outer_scores.append(float(m["roc_auc"]))
-        for k in outer_metrics.keys():
-            outer_metrics[k].append(float(m[k]))
 
-    outer_arr = np.asarray(outer_scores, dtype=float)
-    metrics_mean = {k: float(np.mean(v)) for k, v in outer_metrics.items()}
-    metrics_std = {k: float(np.std(v, ddof=1)) if len(v) > 1 else 0.0 for k, v in outer_metrics.items()}
+        fold_rows.append({
+            "fold": fold_id,
+            "roc_auc": m["roc_auc"],
+            "precision": m["precision"],
+            "recall": m["recall"],
+            "f1": m["f1"],
+            "accuracy": m["accuracy"],
+            "balanced_accuracy": m["balanced_accuracy"],
+        })
+
+    fold_df = pd.DataFrame(fold_rows)
+    mean_scores = {c: float(fold_df[c].mean()) for c in fold_df.columns if c != "fold"}
+    std_scores = {c: float(fold_df[c].std(ddof=1)) for c in fold_df.columns if c != "fold"}
+
+    # Count best_params “signatures”
+    sigs = [str(sorted(p.items())) for p in best_params]
+    counts = Counter(sigs).most_common(10)
 
     return NestedCVResult(
-        mode="nested_grid",
+        model_name=model_name,
         outer_split_fingerprint=fp_outer,
-        inner_n_splits=int(inner_n_splits),
-        scoring=scoring,
-        outer_fold_scores=outer_arr,
-        mean_score=float(np.mean(outer_arr)),
-        std_score=float(np.std(outer_arr, ddof=1)) if len(outer_arr) > 1 else 0.0,
-        outer_metrics_mean=metrics_mean,
-        outer_metrics_std=metrics_std,
-        best_params_per_fold=best_params_per_fold,
-    )
-
-
-def nested_cv_random_search(
-    pipeline: Pipeline,
-    X,
-    y: Iterable[int],
-    *,
-    outer_splits: Sequence[Split],
-    param_distributions: Dict[str, Any],
-    n_iter: int = 25,
-    scoring: str = "roc_auc",
-    inner_n_splits: int = 5,
-    inner_random_state: int = 123,
-    n_jobs: Optional[int] = None,
-) -> NestedCVResult:
-    """
-    Nested CV with RandomizedSearchCV inner loop.
-    """
-    y_arr = _ensure_binary_1d(y)
-    s7.validate_cv_splits(outer_splits, n_samples=len(y_arr))
-    fp_outer = s7.cv_splits_fingerprint(outer_splits)
-
-    outer_scores: List[float] = []
-    outer_metrics: Dict[str, List[float]] = {k: [] for k in ["roc_auc", "precision", "recall", "f1", "accuracy", "balanced_accuracy"]}
-    best_params_per_fold: List[Dict[str, Any]] = []
-
-    for fold_i, (tr, te) in enumerate(outer_splits):
-        tr = np.asarray(tr, dtype=np.int64)
-        te = np.asarray(te, dtype=np.int64)
-
-        X_tr = _safe_index(X, tr)
-        y_tr = y_arr[tr]
-        X_te = _safe_index(X, te)
-        y_te = y_arr[te]
-
-        inner_cv = StratifiedKFold(
-            n_splits=int(inner_n_splits),
-            shuffle=True,
-            random_state=int(inner_random_state + fold_i),
-        )
-
-        rs = RandomizedSearchCV(
-            estimator=clone(pipeline),
-            param_distributions=param_distributions,
-            n_iter=int(n_iter),
-            scoring=scoring,
-            cv=inner_cv,
-            refit=True,
-            random_state=int(inner_random_state + fold_i),
-            n_jobs=n_jobs,
-            error_score="raise",
-            return_train_score=False,
-        )
-        rs.fit(X_tr, y_tr)
-
-        best_params_per_fold.append(dict(rs.best_params_))
-
-        best_est = rs.best_estimator_
-        y_pred = np.asarray(best_est.predict(X_te), dtype=int)
-        y_score = _get_score_vector(best_est, X_te, positive_label=1)
-
-        m = _compute_metrics(y_te, y_pred, y_score)
-        outer_scores.append(float(m["roc_auc"]))
-        for k in outer_metrics.keys():
-            outer_metrics[k].append(float(m[k]))
-
-    outer_arr = np.asarray(outer_scores, dtype=float)
-    metrics_mean = {k: float(np.mean(v)) for k, v in outer_metrics.items()}
-    metrics_std = {k: float(np.std(v, ddof=1)) if len(v) > 1 else 0.0 for k, v in outer_metrics.items()}
-
-    return NestedCVResult(
-        mode="nested_random",
-        outer_split_fingerprint=fp_outer,
-        inner_n_splits=int(inner_n_splits),
-        scoring=scoring,
-        outer_fold_scores=outer_arr,
-        mean_score=float(np.mean(outer_arr)),
-        std_score=float(np.std(outer_arr, ddof=1)) if len(outer_arr) > 1 else 0.0,
-        outer_metrics_mean=metrics_mean,
-        outer_metrics_std=metrics_std,
-        best_params_per_fold=best_params_per_fold,
+        fold_metrics=fold_df,
+        mean_scores=mean_scores,
+        std_scores=std_scores,
+        best_params_per_fold=best_params,
+        best_params_counts=counts,
     )
