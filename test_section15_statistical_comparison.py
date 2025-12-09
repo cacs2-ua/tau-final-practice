@@ -3,6 +3,7 @@
 import unittest
 import numpy as np
 import pandas as pd
+import warnings
 
 import section15_statistical_comparison as s15
 
@@ -58,12 +59,22 @@ class TestSection15StatisticalComparison(unittest.TestCase):
         with self.assertRaises(ValueError):
             s15.wilcoxon_compare_fold_scores(a, b)
 
-    def test_wilcoxon_identical_scores_default_wilcox_raises(self):
-        # SciPy limitation: wilcox/pratt fail if all differences are 0
+    def test_wilcoxon_identical_scores_default_wilcox_tie_and_not_reject(self):
         a = [0.7, 0.8, 0.9, 0.85]
         b = [0.7, 0.8, 0.9, 0.85]
-        with self.assertRaises(ValueError):
-            s15.wilcoxon_compare_fold_scores(a, b)  # default zero_method="wilcox"
+
+        # Some SciPy versions emit RuntimeWarning and return p=nan instead of raising
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            rep = s15.wilcoxon_compare_fold_scores(a, b, zero_method="wilcox")
+
+        self.assertEqual(rep.winner, "tie")
+        self.assertFalse(rep.reject_h0)
+        self.assertEqual(rep.n_pairs, 0)  # effect size removes zero diffs
+
+        # Accept either p=1.0 (if you add the guard) or p=nan (SciPy behavior)
+        self.assertTrue(np.isnan(rep.p_value) or abs(rep.p_value - 1.0) < 1e-12)
+
 
     def test_wilcoxon_identical_scores_with_zsplit_returns_p1(self):
         a = [0.7, 0.8, 0.9, 0.85]
