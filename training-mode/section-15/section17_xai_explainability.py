@@ -1,785 +1,537 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Sequence, Tuple, Union, Literal, Callable
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
-from sklearn.base import clone
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
+from sklearn.tree import DecisionTreeClassifier
+
+import section5_preprocessing_pipeline as s5
 
 
-# ---------------------------------------------------------------------
-# Section 17 — XAI / Explainability (Global + Local)
-#
-# Goals:
-# - Global importance (overall + by subgroup) using a robust method that works
-#   for ANY pipeline: permutation importance on RAW input columns.
-# - Global importance (embedded/model-specific) when available:
-#     * Linear models: |coef|
-#     * Tree-based: feature_importances_
-#   (Only when we can map transformed feature names safely.)
-# - Local explanations for specific instances:
-#     * Transparent models: linear contribution table, decision-tree rules
-#     * Opaque models: SHAP (optional external library; installed separately)
-#
-# Notes:
-# - We intentionally support RAW-level permutation importance because the
-#   diabetes dataset has many one-hot features and custom transformers,
-#   making transformed feature-name reconstruction brittle.
-# - IMPORTANT: We DO NOT use make_scorer(needs_threshold=...) because in some
-#   sklearn versions that kwarg can be forwarded to roc_auc_score and crash.
-#   Instead we pass built-in scorer strings like "roc_auc".
-# ---------------------------------------------------------------------
+# -----------------------------
+# Small utilities
+# -----------------------------
+class SparseToCSC(BaseEstimator, TransformerMixin):
+    """Convert sparse matrices to CSC (tree estimators often prefer CSC)."""
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        try:
+            from scipy import sparse
+        except Exception as e:
+            raise RuntimeError("scipy is required. Install with: pip install scipy") from e
+        return X.tocsc() if sparse.issparse(X) else X
 
 
-class XAIError(RuntimeError):
-    """Raised when an XAI operation cannot be completed."""
+def _safe_series_mode(s: pd.Series):
+    s2 = s.dropna()
+    if s2.empty:
+        return np.nan
+    return s2.mode(dropna=True).iloc[0]
 
 
-Split = Tuple[np.ndarray, np.ndarray]
-ImportanceLevel = Literal["raw", "transformed"]
-GlobalMethod = Literal["auto", "permutation_raw", "embedded_transformed"]
-ScoringType = Union[str, Callable[..., float]]
-
-
-# ------------------------------ small utils ------------------------------
-
-
-def _safe_index(X, idx: np.ndarray):
-    if isinstance(X, (pd.DataFrame, pd.Series)):
-        return X.iloc[idx]
-    return X[idx]
-
-
-def _ensure_1d_binary(y: Iterable[int]) -> np.ndarray:
-    y_arr = np.asarray(list(y), dtype=int).ravel()
-    if y_arr.size == 0:
-        raise ValueError("y is empty.")
-    uniq = set(np.unique(y_arr).tolist())
-    if not uniq.issubset({0, 1}):
-        raise ValueError(f"Binary target must be in {{0,1}}. Found: {sorted(list(uniq))}")
-    return y_arr
-
-
-def _has_two_classes(y: np.ndarray) -> bool:
-    return len(np.unique(y)) >= 2
-
-
-def _is_probability_like(scores: np.ndarray) -> bool:
-    scores = np.asarray(scores, dtype=float).ravel()
-    if scores.size == 0:
-        return False
-    return float(np.nanmin(scores)) >= 0.0 and float(np.nanmax(scores)) <= 1.0
-
-
-def _get_feature_pipeline_and_estimator(pipeline: Any) -> Tuple[Optional[Pipeline], Any]:
-    """
-    If input is a sklearn Pipeline, split into:
-      - feature_pipe = all steps except last
-      - estimator = last step
-    Else:
-      - feature_pipe = None
-      - estimator = pipeline
-    """
-    if isinstance(pipeline, Pipeline) and len(pipeline.steps) >= 2:
-        feature_pipe = Pipeline(steps=pipeline.steps[:-1])
-        estimator = pipeline.steps[-1][1]
-        return feature_pipe, estimator
-    return None, pipeline
-
-
-def _get_decision_scores(fitted_model: Any, X) -> np.ndarray:
-    """
-    Decision scores for ROC-AUC and confidence ordering:
-      - predict_proba[:, pos] if available
-      - decision_function if available
-      - else raise
-    """
-    if hasattr(fitted_model, "predict_proba"):
-        proba = np.asarray(fitted_model.predict_proba(X), dtype=float)
+def _predict_score_pos1(pipe: Pipeline, X: pd.DataFrame) -> np.ndarray:
+    """Return continuous score for positive class (1): proba if available else decision_function."""
+    if hasattr(pipe, "predict_proba"):
+        proba = np.asarray(pipe.predict_proba(X))
         if proba.ndim != 2 or proba.shape[1] < 2:
-            raise XAIError("predict_proba must return [n_samples, 2+] for binary tasks.")
-        # positive class index (best-effort)
-        classes = getattr(fitted_model, "classes_", None)
-        if classes is None:
-            pos_idx = 1
-        else:
-            classes = np.asarray(classes)
-            pos_idx = int(np.where(classes == 1)[0][0]) if 1 in set(classes.tolist()) else 1
-        return proba[:, pos_idx]
+            raise ValueError("predict_proba must return [n_samples, 2+].")
+        # assume class 1 is the positive (your target is 0/1)
+        # sklearn orders classes_ ascending, so column for class 1 is usually index 1
+        return proba[:, 1].astype(float)
 
-    if hasattr(fitted_model, "decision_function"):
-        s = np.asarray(fitted_model.decision_function(X), dtype=float).ravel()
-        return s
+    if hasattr(pipe, "decision_function"):
+        return np.asarray(pipe.decision_function(X), dtype=float).ravel()
 
-    raise XAIError("Model must expose predict_proba or decision_function to get decision scores.")
+    raise ValueError("Pipeline must expose predict_proba or decision_function.")
 
 
-# ------------------------------ results types ------------------------------
-
-
-@dataclass(frozen=True)
-class GlobalImportanceResult:
-    level: ImportanceLevel
-    method: str
-    importance: pd.DataFrame  # columns: feature, importance_mean, importance_std
-    fold_importances: Optional[pd.DataFrame] = None  # optional: fold x feature table
-
-
-@dataclass(frozen=True)
-class HardErrorCase:
-    index: int
-    y_true: int
-    y_pred: int
-    error_type: str  # "FP" or "FN"
-    score: float
-    confidence: float
-
-
-@dataclass(frozen=True)
-class LocalLinearExplanation:
-    index: int
-    pred_label: int
-    pred_score: float
-    base_value: float
-    contributions: pd.DataFrame  # feature, value, coef, contribution
-
-
-@dataclass(frozen=True)
-class LocalTreeExplanation:
-    index: int
-    pred_label: int
-    pred_score: float
-    rules_text: str
-
-
-@dataclass(frozen=True)
-class LocalShapExplanation:
-    index: int
-    pred_label: int
-    pred_score: float
-    shap_top: pd.DataFrame  # feature, shap_value
-    base_value: Optional[float] = None
-
-
-# ------------------------------ selecting “hard errors” ------------------------------
-
-
-def select_hard_errors_from_oof(
-    *,
-    y_true: Union[np.ndarray, Sequence[int]],
-    y_pred: Union[np.ndarray, Sequence[int]],
-    y_score: Union[np.ndarray, Sequence[float]],
-    top_n: int = 3,
-) -> List[HardErrorCase]:
+def _get_preprocessed_feature_names(pre: Pipeline) -> List[str]:
     """
-    Pick the “hardest” misclassifications from out-of-fold predictions:
-    - wrong predictions
-    - highest confidence (far from threshold)
-
-    If y_score is probability-like -> threshold=0.5
-    Else (margin) -> threshold=0.0
+    Robust feature-name extraction for your Section 5 preprocessor:
+      - num: num__{col}
+      - ord: ord__{col}
+      - cat: onehot feature names if available, else cat__{col} (fallback)
     """
-    yt = _ensure_1d_binary(y_true)
-    yp = np.asarray(y_pred, dtype=int).ravel()
-    ys = np.asarray(y_score, dtype=float).ravel()
+    if "features" not in pre.named_steps:
+        raise ValueError("Expected preprocessor Pipeline to contain a 'features' ColumnTransformer step.")
 
-    if yt.size != yp.size or yt.size != ys.size:
-        raise ValueError("y_true, y_pred, y_score must have the same length.")
+    ct = pre.named_steps["features"]
 
-    prob_like = _is_probability_like(ys)
-    thresh = 0.5 if prob_like else 0.0
+    # ColumnTransformer fitted transformers live in ct.transformers_
+    names: List[str] = []
+    for name, trans, cols in ct.transformers_:
+        cols = list(cols) if isinstance(cols, (list, tuple)) else [cols]
 
-    wrong = (yp != yt)
-    idxs = np.where(wrong)[0].tolist()
-    if not idxs:
-        return []
-
-    cases: List[HardErrorCase] = []
-    for i in idxs:
-        score = float(ys[i])
-        confidence = abs(score - thresh)
-        err_type = "FP" if (yt[i] == 0 and yp[i] == 1) else "FN"
-        cases.append(
-            HardErrorCase(
-                index=int(i),
-                y_true=int(yt[i]),
-                y_pred=int(yp[i]),
-                error_type=err_type,
-                score=score,
-                confidence=float(confidence),
-            )
-        )
-
-    cases.sort(key=lambda c: c.confidence, reverse=True)
-    return cases[: int(top_n)]
-
-
-# ------------------------------ GLOBAL: permutation importance on RAW columns ------------------------------
-
-
-def compute_global_importance_permutation_cv_raw(
-    pipeline: Any,
-    X: pd.DataFrame,
-    y: Iterable[int],
-    *,
-    cv_splits: Sequence[Split],
-    scoring: ScoringType = "roc_auc",
-    n_repeats: int = 3,
-    random_state: int = 42,
-    max_features: Optional[int] = 30,
-) -> GlobalImportanceResult:
-    """
-    Robust global importance that works for ANY sklearn pipeline:
-    permutation importance on RAW input columns within each CV fold.
-
-    Returns mean ± std importance across folds.
-
-    IMPORTANT: Use sklearn's built-in scorer strings (e.g. "roc_auc")
-    instead of make_scorer(needs_threshold=...), to avoid API mismatches.
-    """
-    if not isinstance(X, pd.DataFrame):
-        raise ValueError("X must be a pandas DataFrame for RAW-level permutation importance.")
-    y_arr = _ensure_1d_binary(y)
-
-    if len(cv_splits) == 0:
-        raise ValueError("cv_splits is empty.")
-
-    if scoring is None:
-        scoring = "roc_auc"
-
-    fold_imps: List[np.ndarray] = []
-    used_folds = 0
-
-    for tr, te in cv_splits:
-        tr = np.asarray(tr, dtype=np.int64)
-        te = np.asarray(te, dtype=np.int64)
-
-        model = clone(pipeline)
-        model.fit(_safe_index(X, tr), y_arr[tr])
-
-        y_te = y_arr[te]
-        if not _has_two_classes(y_te):
-            # Can happen for tiny datasets or subgroup subsets; skip the fold
+        if name == "num":
+            names.extend([f"num__{c}" for c in cols])
             continue
 
-        pi = permutation_importance(
-            model,
-            _safe_index(X, te),
-            y_te,
-            scoring=scoring,  # ✅ string/callable scorer (no needs_threshold kwarg)
-            n_repeats=int(n_repeats),
-            random_state=int(random_state),
-            n_jobs=None,
-        )
-        fold_imps.append(np.asarray(pi.importances_mean, dtype=float))
-        used_folds += 1
+        if name == "ord":
+            # OrdinalEncoder outputs 1 column per input column
+            names.extend([f"ord__{c}" for c in cols])
+            continue
 
-    if used_folds == 0:
-        raise XAIError("No fold had both classes in the test split; cannot compute permutation importance.")
+        if name == "cat":
+            # Expect Pipeline(..., ("onehot", OneHotEncoder))
+            try:
+                onehot = ct.named_transformers_["cat"].named_steps["onehot"]
+                # sklearn >= 1.0
+                oh_names = list(onehot.get_feature_names_out(cols))
+                names.extend([f"cat__{n}" for n in oh_names])
+            except Exception:
+                # fallback: one name per raw categorical col (less precise)
+                names.extend([f"cat__{c}" for c in cols])
+            continue
 
-    M = np.vstack(fold_imps)  # [n_folds_used, n_features]
-    mean_imp = M.mean(axis=0)
-    std_imp = M.std(axis=0, ddof=1) if M.shape[0] > 1 else np.zeros_like(mean_imp)
+        # any other blocks
+        names.extend([f"{name}__{c}" for c in cols])
 
-    df_imp = pd.DataFrame(
-        {
-            "feature": list(X.columns),
-            "importance_mean": mean_imp,
-            "importance_std": std_imp,
-        }
-    ).sort_values("importance_mean", ascending=False)
-
-    if max_features is not None:
-        df_imp = df_imp.head(int(max_features)).reset_index(drop=True)
-    else:
-        df_imp = df_imp.reset_index(drop=True)
-
-    fold_df = pd.DataFrame(M, columns=list(X.columns))
-    return GlobalImportanceResult(
-        level="raw",
-        method="permutation_cv_raw",
-        importance=df_imp,
-        fold_importances=fold_df,
-    )
+    return names
 
 
-def compute_global_importance_permutation_raw(
-    fitted_pipeline: Any,
-    X: pd.DataFrame,
-    y: Iterable[int],
+def _plot_top_barh(df_imp: pd.DataFrame, *, title: str, top_n: int = 25):
+    if df_imp is None or df_imp.empty:
+        print(f"[plot skipped] {title}: empty importance table.")
+        return
+    d = df_imp.head(top_n).iloc[::-1]  # reverse for barh nice ordering
+    plt.figure(figsize=(10, max(4, int(0.22 * len(d) + 2))))
+    plt.barh(d["feature"].astype(str), d["importance"].astype(float))
+    plt.title(title)
+    plt.xlabel("Importance")
+    plt.tight_layout()
+    plt.show()
+
+
+def _global_importance_logreg(pipe: Pipeline, feature_names: List[str], top_n: int = 30) -> pd.DataFrame:
+    pre = pipe.named_steps["pre"]
+    clf: LogisticRegression = pipe.named_steps["clf"]
+
+    coef = np.asarray(clf.coef_).ravel()
+    if len(coef) != len(feature_names):
+        raise ValueError(f"coef dim {len(coef)} != feature_names dim {len(feature_names)}")
+
+    imp = np.abs(coef)
+    out = pd.DataFrame(
+        {"feature": feature_names, "importance": imp, "coef": coef}
+    ).sort_values("importance", ascending=False).reset_index(drop=True)
+    return out.head(top_n)
+
+
+def _global_importance_tree(pipe: Pipeline, feature_names: List[str], top_n: int = 30) -> pd.DataFrame:
+    clf = pipe.named_steps["clf"]
+    if not hasattr(clf, "feature_importances_"):
+        raise ValueError("Tree-based estimator has no feature_importances_.")
+    imp = np.asarray(clf.feature_importances_, dtype=float).ravel()
+    if len(imp) != len(feature_names):
+        raise ValueError(f"feature_importances dim {len(imp)} != feature_names dim {len(feature_names)}")
+
+    out = pd.DataFrame({"feature": feature_names, "importance": imp})
+    out = out.sort_values("importance", ascending=False).reset_index(drop=True)
+    return out.head(top_n)
+
+
+def _compute_elderly_from_age_bucket(age_series: pd.Series) -> pd.Series:
+    """
+    If you don't have 'elderly' yet, infer from 'age' buckets:
+      elderly = midpoint(age) >= 65
+    """
+    def midpoint(v) -> float:
+        if v is None:
+            return np.nan
+        s = str(v).strip()
+        if not s.startswith("[") or "-" not in s:
+            return np.nan
+        try:
+            inside = s.strip("[]()")
+            a, b = inside.split("-")
+            return (float(a) + float(b)) / 2.0
+        except Exception:
+            return np.nan
+
+    mid = age_series.map(midpoint)
+    return (mid.fillna(-1) >= 65).astype(int)
+
+
+def _perm_importance_raw_cols(
+    pipe: Pipeline,
+    X_test: pd.DataFrame,
+    y_test: np.ndarray,
     *,
-    scoring: ScoringType = "roc_auc",
     n_repeats: int = 5,
     random_state: int = 42,
-    max_features: Optional[int] = 30,
-) -> GlobalImportanceResult:
-    """
-    Single-fit permutation importance (no CV aggregation).
-    Useful for subgroup analysis once you have a fitted model.
+    top_n: int = 25,
+) -> pd.DataFrame:
+    # Need both classes for ROC-AUC
+    if len(np.unique(y_test)) < 2:
+        return pd.DataFrame(columns=["feature", "importance_mean", "importance_std"])
 
-    IMPORTANT: Use sklearn's built-in scorer strings (e.g. "roc_auc")
-    instead of make_scorer(needs_threshold=...), to avoid API mismatches.
-    """
-    if not isinstance(X, pd.DataFrame):
-        raise ValueError("X must be a pandas DataFrame.")
-    y_arr = _ensure_1d_binary(y)
-    if not _has_two_classes(y_arr):
-        raise ValueError("Need at least two classes to compute ROC-AUC permutation importance.")
-
-    if scoring is None:
-        scoring = "roc_auc"
-
-    pi = permutation_importance(
-        fitted_pipeline,
-        X,
-        y_arr,
-        scoring=scoring,  # ✅ string/callable scorer (no needs_threshold kwarg)
+    r = permutation_importance(
+        pipe,
+        X_test,
+        y_test,
+        scoring="roc_auc",
         n_repeats=int(n_repeats),
         random_state=int(random_state),
         n_jobs=None,
     )
-
-    mean_imp = np.asarray(pi.importances_mean, dtype=float)
-    std_imp = np.asarray(pi.importances_std, dtype=float)
-
-    df_imp = pd.DataFrame(
-        {"feature": list(X.columns), "importance_mean": mean_imp, "importance_std": std_imp}
-    ).sort_values("importance_mean", ascending=False)
-
-    if max_features is not None:
-        df_imp = df_imp.head(int(max_features)).reset_index(drop=True)
-    else:
-        df_imp = df_imp.reset_index(drop=True)
-
-    return GlobalImportanceResult(
-        level="raw",
-        method="permutation_raw",
-        importance=df_imp,
-        fold_importances=None,
-    )
-
-
-# ------------------------------ GLOBAL: embedded/model-specific on TRANSFORMED features (best-effort) ------------------------------
-
-
-def _try_get_transformed_feature_names_from_section5_preprocessor(
-    fitted_pipeline: Any,
-) -> Optional[List[str]]:
-    """
-    Best-effort feature-name extraction for your Section 5 preprocessor structure:
-      Pipeline(pre -> ColumnTransformer(features=...))
-    Works even with custom transformers by using known block behavior:
-      - num: 1 feature per numeric column
-      - ord: 1 feature per ordinal column
-      - cat: use OneHotEncoder categories_
-
-    Returns None if structure is not compatible.
-    """
-    if not isinstance(fitted_pipeline, Pipeline):
-        return None
-    if "pre" not in fitted_pipeline.named_steps:
-        return None
-
-    pre = fitted_pipeline.named_steps["pre"]
-    if not isinstance(pre, Pipeline):
-        return None
-    if "features" not in pre.named_steps:
-        return None
-
-    ct = pre.named_steps["features"]
-    if not hasattr(ct, "transformers_"):
-        return None
-
-    names: List[str] = []
-    for block_name, trans, cols in ct.transformers_:
-        if trans == "drop":
-            continue
-        cols = list(cols) if isinstance(cols, (list, tuple, np.ndarray)) else [cols]
-
-        if block_name == "num":
-            names.extend([f"num__{c}" for c in cols])
-            continue
-
-        if block_name == "ord":
-            names.extend([f"ord__{c}" for c in cols])
-            continue
-
-        if block_name == "cat":
-            # Expect a Pipeline with a OneHotEncoder at named_steps["onehot"]
-            try:
-                onehot = trans.named_steps["onehot"]
-            except Exception:
-                return None
-
-            # Preferred
-            if hasattr(onehot, "get_feature_names_out"):
-                try:
-                    outn = onehot.get_feature_names_out(cols).tolist()
-                    names.extend([f"cat__{n}" for n in outn])
-                    continue
-                except Exception:
-                    pass
-
-            # Fallback using categories_
-            cats = getattr(onehot, "categories_", None)
-            if cats is None:
-                return None
-            for c, cat_list in zip(cols, cats):
-                for v in cat_list:
-                    names.append(f"cat__{c}={v}")
-            continue
-
-        # Unknown block: cannot safely infer
-        return None
-
-    return names if names else None
-
-
-def compute_global_importance_embedded_transformed(
-    fitted_pipeline: Any,
-    X_train: pd.DataFrame,
-    y_train: Iterable[int],
-    *,
-    max_features: int = 30,
-) -> GlobalImportanceResult:
-    """
-    Uses model-internal importance on transformed features when possible:
-      - Linear models: abs(coef_)
-      - Tree models: feature_importances_
-
-    Requires:
-      - fitted_pipeline is a sklearn Pipeline with steps ending in an estimator
-      - we can infer transformed feature names (best-effort)
-    """
-    if not isinstance(fitted_pipeline, Pipeline):
-        raise XAIError("Embedded transformed importance requires a sklearn Pipeline.")
-
-    # Ensure it is fitted (if not, fit it quickly)
-    try:
-        _ = fitted_pipeline.predict(X_train.head(2))
-    except Exception:
-        fitted_pipeline.fit(X_train, _ensure_1d_binary(y_train))
-
-    feature_pipe, estimator = _get_feature_pipeline_and_estimator(fitted_pipeline)
-    if feature_pipe is None:
-        raise XAIError("Pipeline too short to compute transformed importance.")
-
-    names = _try_get_transformed_feature_names_from_section5_preprocessor(fitted_pipeline)
-    if names is None:
-        raise XAIError(
-            "Could not infer transformed feature names (likely due to a non-Section5 preprocessor or custom steps). "
-            "Use RAW permutation importance instead."
-        )
-
-    # Transform X to match estimator feature space
-    Xt = feature_pipe.transform(X_train)
-    n_features = Xt.shape[1]
-    if len(names) != n_features:
-        raise XAIError(
-            f"Transformed feature-name length mismatch: names={len(names)} vs Xt_dim={n_features}."
-        )
-
-    # Fit estimator alone (to ensure coef_/feature_importances_ exist and match Xt)
-    est = clone(estimator)
-    est.fit(Xt, _ensure_1d_binary(y_train))
-
-    if hasattr(est, "coef_"):
-        coef = np.asarray(est.coef_, dtype=float)
-        if coef.ndim == 2:
-            coef = coef[0]
-        imp = np.abs(coef)
-        method = "embedded_abs_coef"
-    elif hasattr(est, "feature_importances_"):
-        imp = np.asarray(est.feature_importances_, dtype=float)
-        method = "embedded_tree_importance"
-    else:
-        raise XAIError("Estimator has neither coef_ nor feature_importances_.")
-
-    df_imp = pd.DataFrame(
-        {"feature": names, "importance_mean": imp, "importance_std": np.zeros_like(imp)}
-    ).sort_values("importance_mean", ascending=False)
-
-    df_imp = df_imp.head(int(max_features)).reset_index(drop=True)
-
-    return GlobalImportanceResult(
-        level="transformed",
-        method=method,
-        importance=df_imp,
-        fold_importances=None,
-    )
-
-
-# ------------------------------ LOCAL: transparent explanations ------------------------------
-
-
-def explain_instance_linear(
-    fitted_pipeline: Any,
-    X_row: pd.DataFrame,
-    *,
-    top_k: int = 15,
-) -> LocalLinearExplanation:
-    """
-    Local explanation for linear classifiers: contribution = value * coef (in transformed space).
-    Works best for LogisticRegression / linear SVM with coef_.
-    """
-    if not isinstance(fitted_pipeline, Pipeline):
-        raise XAIError("Linear local explanation expects a fitted sklearn Pipeline.")
-    if not isinstance(X_row, pd.DataFrame) or len(X_row) != 1:
-        raise ValueError("X_row must be a single-row DataFrame.")
-
-    # Split features vs estimator
-    feature_pipe, estimator = _get_feature_pipeline_and_estimator(fitted_pipeline)
-    if feature_pipe is None:
-        raise XAIError("Pipeline too short for linear explanation.")
-
-    # Predict label & score from full pipeline (raw)
-    pred_label = int(fitted_pipeline.predict(X_row)[0])
-    try:
-        pred_score = float(_get_decision_scores(fitted_pipeline, X_row)[0])
-    except Exception:
-        pred_score = float("nan")
-
-    # Names in transformed space (best-effort)
-    names = _try_get_transformed_feature_names_from_section5_preprocessor(fitted_pipeline)
-    if names is None:
-        raise XAIError(
-            "Could not infer transformed feature names. "
-            "If this is not a Section5-based pipeline, use SHAP for local explanations."
-        )
-
-    Xt = feature_pipe.transform(X_row)  # (1, d)
-    Xt = np.asarray(Xt.todense() if hasattr(Xt, "todense") else Xt, dtype=float)
-    if Xt.ndim != 2 or Xt.shape[0] != 1:
-        raise XAIError("Unexpected transformed shape for X_row.")
-
-    # Access fitted estimator directly
-    fitted_est = fitted_pipeline.steps[-1][1]
-    if not hasattr(fitted_est, "coef_"):
-        raise XAIError("Final estimator has no coef_. Not a linear model with coefficients.")
-
-    coef = np.asarray(fitted_est.coef_, dtype=float)
-    coef = coef[0] if coef.ndim == 2 else coef
-    if coef.shape[0] != Xt.shape[1]:
-        raise XAIError("coef_ dimension does not match transformed feature dimension.")
-
-    intercept = float(np.asarray(getattr(fitted_est, "intercept_", [0.0]), dtype=float).ravel()[0])
-
-    vals = Xt.ravel()
-    contrib = vals * coef
-
-    df = pd.DataFrame(
+    out = pd.DataFrame(
         {
-            "feature": names,
-            "value": vals,
-            "coef": coef,
-            "contribution": contrib,
+            "feature": list(X_test.columns),
+            "importance_mean": r.importances_mean.astype(float),
+            "importance_std": r.importances_std.astype(float),
         }
-    )
-    df["abs_contribution"] = df["contribution"].abs()
-    df = df.sort_values("abs_contribution", ascending=False).drop(columns=["abs_contribution"])
-    df = df.head(int(top_k)).reset_index(drop=True)
-
-    return LocalLinearExplanation(
-        index=int(X_row.index[0]),
-        pred_label=pred_label,
-        pred_score=float(pred_score),
-        base_value=intercept,
-        contributions=df,
-    )
+    ).sort_values("importance_mean", ascending=False).reset_index(drop=True)
+    return out.head(top_n)
 
 
-def explain_instance_decision_tree(
-    fitted_pipeline: Any,
+def _pick_top_confident_errors(
+    pipe: Pipeline,
+    X_test: pd.DataFrame,
+    y_test: np.ndarray,
+    *,
+    k: int = 3,
+) -> pd.DataFrame:
+    scores = _predict_score_pos1(pipe, X_test)
+    pred = (scores >= 0.5).astype(int)
+    wrong = pred != y_test
+
+    if wrong.sum() == 0:
+        return pd.DataFrame(columns=["row_ix", "y_true", "y_pred", "score", "confidence"])
+
+    confidence = np.abs(scores - 0.5)
+    idx = np.where(wrong)[0]
+    # pick the most confident wrong
+    idx_sorted = idx[np.argsort(confidence[idx])[::-1]]
+    idx_pick = idx_sorted[: int(k)]
+
+    return pd.DataFrame(
+        {
+            "row_ix": idx_pick,
+            "y_true": y_test[idx_pick],
+            "y_pred": pred[idx_pick],
+            "score": scores[idx_pick],
+            "confidence": confidence[idx_pick],
+        }
+    ).sort_values("confidence", ascending=False).reset_index(drop=True)
+
+
+def _local_explain_logreg_exact(
+    pipe: Pipeline,
+    X_row: pd.DataFrame,
+    feature_names: List[str],
+    *,
+    top_n: int = 15,
+) -> pd.DataFrame:
+    """
+    Exact local explanation for LogisticRegression on the *preprocessed* feature space:
+      contribution_i = coef_i * x_i
+    """
+    pre = pipe.named_steps["pre"]
+    clf: LogisticRegression = pipe.named_steps["clf"]
+
+    Xz = pre.transform(X_row)
+    # make dense 1D for this single row only
+    try:
+        x = np.asarray(Xz.toarray()).ravel()
+    except Exception:
+        x = np.asarray(Xz).ravel()
+
+    coef = np.asarray(clf.coef_).ravel()
+    if x.shape[0] != coef.shape[0] or len(feature_names) != coef.shape[0]:
+        raise ValueError("Dimension mismatch in local_explain_logreg_exact.")
+
+    contrib = x * coef
+    out = pd.DataFrame(
+        {"feature": feature_names, "x_value": x, "coef": coef, "contribution": contrib, "abs_contribution": np.abs(contrib)}
+    ).sort_values("abs_contribution", ascending=False).reset_index(drop=True)
+
+    return out.head(top_n)[["feature", "x_value", "coef", "contribution"]]
+
+
+def _baseline_values_from_train(X_train: pd.DataFrame) -> Dict[str, object]:
+    """
+    Baseline replacement values for counterfactual-style local explanation:
+      - numeric -> median
+      - categorical/object -> mode
+    """
+    base: Dict[str, object] = {}
+    for c in X_train.columns:
+        s = X_train[c]
+        if pd.api.types.is_numeric_dtype(s):
+            base[c] = float(pd.to_numeric(s, errors="coerce").median())
+        else:
+            base[c] = _safe_series_mode(s.astype("object"))
+    return base
+
+
+def _local_counterfactual_deltas(
+    pipe: Pipeline,
     X_row: pd.DataFrame,
     *,
-    max_depth: int = 4,
-) -> LocalTreeExplanation:
+    baseline_values: Dict[str, object],
+    candidate_features: List[str],
+    top_n: int = 15,
+) -> pd.DataFrame:
     """
-    Local explanation for a DecisionTreeClassifier: exports text rules.
-    Requires the final estimator to be DecisionTreeClassifier-like.
+    Model-agnostic local explanation in RAW feature space:
+      For each raw feature f:
+        - replace f with baseline(train) value
+        - delta = score(original) - score(replaced)
+      Positive delta => feature pushes score towards class 1.
     """
-    if not isinstance(fitted_pipeline, Pipeline):
-        raise XAIError("Tree local explanation expects a fitted sklearn Pipeline.")
-    if not isinstance(X_row, pd.DataFrame) or len(X_row) != 1:
+    if len(X_row) != 1:
         raise ValueError("X_row must be a single-row DataFrame.")
 
-    pred_label = int(fitted_pipeline.predict(X_row)[0])
-    try:
-        pred_score = float(_get_decision_scores(fitted_pipeline, X_row)[0])
-    except Exception:
-        pred_score = float("nan")
+    base_score = float(_predict_score_pos1(pipe, X_row)[0])
 
-    feature_pipe, _ = _get_feature_pipeline_and_estimator(fitted_pipeline)
-    if feature_pipe is None:
-        raise XAIError("Pipeline too short for tree explanation.")
-    Xt = feature_pipe.transform(X_row)
+    rows = []
+    for f in candidate_features:
+        if f not in X_row.columns:
+            continue
+        x_cf = X_row.copy()
+        x_cf.iloc[0, x_cf.columns.get_loc(f)] = baseline_values.get(f, np.nan)
+        s_cf = float(_predict_score_pos1(pipe, x_cf)[0])
+        rows.append(
+            {
+                "feature": f,
+                "orig_value": X_row.iloc[0][f],
+                "baseline_value": baseline_values.get(f, np.nan),
+                "delta_score": base_score - s_cf,
+                "abs_delta": abs(base_score - s_cf),
+            }
+        )
 
-    names = _try_get_transformed_feature_names_from_section5_preprocessor(fitted_pipeline)
-    if names is None:
-        raise XAIError("Could not infer transformed feature names for tree rule export.")
-
-    tree_est = fitted_pipeline.steps[-1][1]
-    if not hasattr(tree_est, "tree_"):
-        raise XAIError("Final estimator does not look like a DecisionTreeClassifier.")
-
-    try:
-        from sklearn.tree import export_text
-        _ = np.asarray(Xt.todense() if hasattr(Xt, "todense") else Xt, dtype=float)
-        rules = export_text(tree_est, feature_names=names, max_depth=int(max_depth))
-    except Exception as e:
-        raise XAIError(f"Failed to export decision-tree rules: {e}") from e
-
-    return LocalTreeExplanation(
-        index=int(X_row.index[0]),
-        pred_label=pred_label,
-        pred_score=float(pred_score),
-        rules_text=str(rules),
-    )
+    out = pd.DataFrame(rows).sort_values("abs_delta", ascending=False).reset_index(drop=True)
+    return out.head(top_n)[["feature", "orig_value", "baseline_value", "delta_score"]]
 
 
-# ------------------------------ LOCAL: SHAP (opaque models) ------------------------------
+@dataclass(frozen=True)
+class Section17XAIResult:
+    split_random_state: int
+    test_size: float
+    models: Dict[str, Pipeline]
+    feature_names: List[str]
+    global_importances_encoded: Dict[str, pd.DataFrame]   # per model, encoded-space
+    global_importance_raw_perm: pd.DataFrame              # best model, raw-space
+    global_importance_raw_perm_elderly: Optional[pd.DataFrame]
+    global_importance_raw_perm_nonelderly: Optional[pd.DataFrame]
+    hard_errors: pd.DataFrame                             # picked on best model
+    local_logreg_exact: Dict[int, pd.DataFrame]           # row_ix -> table
+    local_best_counterfactual: Dict[int, pd.DataFrame]    # row_ix -> table
 
 
-def stratified_sample_indices(
-    y: Iterable[int],
+def run_section17_xai(
+    df: pd.DataFrame,
     *,
-    n: int = 200,
+    target_col: str = "readmitted_30d",
+    preprocess_config: Optional[s5.DiabetesPreprocessConfig] = None,
+    test_size: float = 0.20,
     random_state: int = 42,
-) -> np.ndarray:
+    top_n_global: int = 25,
+    n_repeats_perm: int = 5,
+    top_n_local: int = 15,
+) -> Section17XAIResult:
     """
-    Stratified sampling indices for background sets (SHAP).
+    End-to-end XAI runner:
+      - Fit 3 model families: Logistic Regression, Decision Tree, Random Forest
+      - Global (encoded-space): coef / feature_importances_
+      - Global (raw-space): permutation importance on raw columns (model-agnostic)
+      - Subgroup (elderly vs non-elderly): raw permutation importance
+      - Local: 3 high-confidence wrong predictions on the best model (RF):
+          * LR exact contributions (encoded)
+          * RF model-agnostic counterfactual deltas (raw)
     """
-    y_arr = _ensure_1d_binary(y)
-    n = int(n)
-    rng = np.random.RandomState(int(random_state))
+    if preprocess_config is None:
+        preprocess_config = s5.DiabetesPreprocessConfig(onehot_sparse=True, rare_min_count=50, scale_numeric=True, scaler="standard")
 
-    idx0 = np.where(y_arr == 0)[0]
-    idx1 = np.where(y_arr == 1)[0]
-    if len(idx0) == 0 or len(idx1) == 0:
-        # fall back to uniform
-        take = min(n, len(y_arr))
-        return rng.choice(np.arange(len(y_arr)), size=take, replace=False)
+    if target_col not in df.columns:
+        raise KeyError(f"Target col '{target_col}' not found in df.")
 
-    n0 = max(1, int(round(n * (len(idx0) / len(y_arr)))))
-    n1 = max(1, n - n0)
+    y = df[target_col].astype(int).to_numpy()
 
-    n0 = min(n0, len(idx0))
-    n1 = min(n1, len(idx1))
+    drop_cols = [c for c in preprocess_config.target_cols if c in df.columns]
+    if target_col not in drop_cols:
+        drop_cols.append(target_col)
 
-    s0 = rng.choice(idx0, size=n0, replace=False)
-    s1 = rng.choice(idx1, size=n1, replace=False)
-    out = np.concatenate([s0, s1])
-    rng.shuffle(out)
-    return out
+    X = df.drop(columns=drop_cols, errors="ignore")
+    if X.shape[1] == 0:
+        raise ValueError("No features left after dropping targets.")
 
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=float(test_size),
+        stratify=y,
+        random_state=int(random_state),
+    )
 
-def explain_instance_shap(
-    fitted_pipeline: Any,
-    X_background: pd.DataFrame,
-    X_row: pd.DataFrame,
-    *,
-    top_k: int = 15,
-) -> LocalShapExplanation:
-    """
-    SHAP local explanation on RAW features (works as black-box for pipelines).
+    # Shared preprocessor template
+    pre = s5.build_preprocessor(df, preprocess_config)
 
-    Requires external dependency:
-      pip install shap
+    # Models (compare transparent vs opaque)
+    lr = LogisticRegression(
+        solver="saga",
+        penalty="l2",
+        max_iter=4000,
+        n_jobs=-1,
+        random_state=int(random_state),
+    )
+    dt = DecisionTreeClassifier(random_state=int(random_state))
+    rf = RandomForestClassifier(
+        n_estimators=300,
+        n_jobs=-1,
+        random_state=int(random_state),
+    )
 
-    We use shap.Explainer with a background dataset (masker).
-    """
-    if not isinstance(X_background, pd.DataFrame) or len(X_background) < 5:
-        raise ValueError("X_background must be a DataFrame with at least 5 rows.")
-    if not isinstance(X_row, pd.DataFrame) or len(X_row) != 1:
-        raise ValueError("X_row must be a single-row DataFrame.")
+    pipes: Dict[str, Pipeline] = {
+        "logistic_regression": Pipeline([("pre", pre), ("clf", lr)]),
+        "decision_tree": Pipeline([("pre", pre), ("to_csc", SparseToCSC()), ("clf", dt)]),
+        "random_forest": Pipeline([("pre", pre), ("to_csc", SparseToCSC()), ("clf", rf)]),
+    }
 
-    try:
-        import shap  # type: ignore
-    except Exception as e:
-        raise XAIError(
-            "SHAP is not installed. Install it with: pip install shap"
-        ) from e
+    # Fit all
+    for _, p in pipes.items():
+        p.fit(X_train, y_train)
 
-    pred_label = int(fitted_pipeline.predict(X_row)[0])
-    try:
-        pred_score = float(_get_decision_scores(fitted_pipeline, X_row)[0])
-    except Exception:
-        pred_score = float("nan")
+    # Feature names from the fitted preprocessor of LR (same design as others)
+    feature_names = _get_preprocessed_feature_names(pipes["logistic_regression"].named_steps["pre"])
 
-    # Build explainer (black-box over the pipeline)
-    explainer = shap.Explainer(fitted_pipeline, X_background)
+    # Global importances on encoded feature space
+    global_encoded: Dict[str, pd.DataFrame] = {
+        "logistic_regression": _global_importance_logreg(pipes["logistic_regression"], feature_names, top_n=top_n_global),
+        "decision_tree": _global_importance_tree(pipes["decision_tree"], feature_names, top_n=top_n_global),
+        "random_forest": _global_importance_tree(pipes["random_forest"], feature_names, top_n=top_n_global),
+    }
 
-    sv = explainer(X_row)  # shap.Explanation
-    values = sv.values
-    base_value = None
+    # Global importance on RAW columns (model-agnostic): use the best/opaque model (RF)
+    perm_raw = _perm_importance_raw_cols(
+        pipes["random_forest"], X_test, y_test,
+        n_repeats=int(n_repeats_perm),
+        random_state=int(random_state),
+        top_n=top_n_global,
+    )
 
-    if isinstance(sv.base_values, np.ndarray):
-        bv = sv.base_values
-        base_value = float(np.ravel(bv)[0])
-
-    # normalize to (n_features,)
-    if np.asarray(values).ndim == 3:
-        values_ = np.asarray(values)[0, :, -1]  # positive class if present
+    # Subgroup permutation importance: elderly vs non-elderly (if possible)
+    if "elderly" in X_test.columns:
+        elderly = X_test["elderly"].astype(int)
+    elif "age_mid" in X_test.columns:
+        elderly = (pd.to_numeric(X_test["age_mid"], errors="coerce").fillna(-1) >= 65).astype(int)
+    elif "age" in X_test.columns:
+        elderly = _compute_elderly_from_age_bucket(X_test["age"].astype("object"))
     else:
-        values_ = np.asarray(values)[0, :]
+        elderly = None
 
-    feat_names = list(X_row.columns)
-    df = pd.DataFrame({"feature": feat_names, "shap_value": values_.astype(float)})
-    df["abs"] = df["shap_value"].abs()
-    df = df.sort_values("abs", ascending=False).drop(columns=["abs"]).head(int(top_k)).reset_index(drop=True)
+    perm_elderly = None
+    perm_nonelderly = None
+    if elderly is not None:
+        mask_e = elderly.to_numpy().astype(int) == 1
+        mask_ne = ~mask_e
 
-    return LocalShapExplanation(
-        index=int(X_row.index[0]),
-        pred_label=pred_label,
-        pred_score=float(pred_score),
-        shap_top=df,
-        base_value=base_value,
+        if mask_e.sum() >= 50 and len(np.unique(y_test[mask_e])) >= 2:
+            perm_elderly = _perm_importance_raw_cols(
+                pipes["random_forest"], X_test.loc[mask_e], y_test[mask_e],
+                n_repeats=int(n_repeats_perm),
+                random_state=int(random_state),
+                top_n=top_n_global,
+            )
+        if mask_ne.sum() >= 50 and len(np.unique(y_test[mask_ne])) >= 2:
+            perm_nonelderly = _perm_importance_raw_cols(
+                pipes["random_forest"], X_test.loc[mask_ne], y_test[mask_ne],
+                n_repeats=int(n_repeats_perm),
+                random_state=int(random_state),
+                top_n=top_n_global,
+            )
+
+    # Pick 3 high-confidence wrong predictions on RF (hard errors)
+    hard = _pick_top_confident_errors(pipes["random_forest"], X_test, y_test, k=3)
+
+    # Local explanations
+    baseline_values = _baseline_values_from_train(X_train)
+
+    # Use top raw features from permutation importance as candidates for local counterfactual deltas
+    candidate_raw = perm_raw["feature"].astype(str).tolist() if perm_raw is not None and not perm_raw.empty else list(X_test.columns)[:30]
+
+    local_lr: Dict[int, pd.DataFrame] = {}
+    local_best: Dict[int, pd.DataFrame] = {}
+
+    for _, row in hard.iterrows():
+        ix = int(row["row_ix"])
+        X_one = X_test.iloc[[ix]]
+
+        # Logistic exact contributions (encoded space)
+        try:
+            local_lr[ix] = _local_explain_logreg_exact(
+                pipes["logistic_regression"], X_one, feature_names, top_n=int(top_n_local)
+            )
+        except Exception as e:
+            local_lr[ix] = pd.DataFrame({"error": [str(e)]})
+
+        # RF counterfactual deltas (raw space)
+        try:
+            local_best[ix] = _local_counterfactual_deltas(
+                pipes["random_forest"],
+                X_one,
+                baseline_values=baseline_values,
+                candidate_features=candidate_raw,
+                top_n=int(top_n_local),
+            )
+        except Exception as e:
+            local_best[ix] = pd.DataFrame({"error": [str(e)]})
+
+    return Section17XAIResult(
+        split_random_state=int(random_state),
+        test_size=float(test_size),
+        models=pipes,
+        feature_names=feature_names,
+        global_importances_encoded=global_encoded,
+        global_importance_raw_perm=perm_raw,
+        global_importance_raw_perm_elderly=perm_elderly,
+        global_importance_raw_perm_nonelderly=perm_nonelderly,
+        hard_errors=hard,
+        local_logreg_exact=local_lr,
+        local_best_counterfactual=local_best,
     )
 
 
-# ------------------------------ plotting helpers (matplotlib only) ------------------------------
+def plot_section17_global(result: Section17XAIResult, *, top_n: int = 25):
+    # Encoded-space plots
+    for model_name, df_imp in result.global_importances_encoded.items():
+        _plot_top_barh(df_imp, title=f"Global importance (encoded) — {model_name}", top_n=top_n)
+
+    # Raw permutation importance plot (best model)
+    if result.global_importance_raw_perm is not None and not result.global_importance_raw_perm.empty:
+        d = result.global_importance_raw_perm.head(top_n).iloc[::-1]
+        plt.figure(figsize=(10, max(4, int(0.22 * len(d) + 2))))
+        plt.barh(d["feature"].astype(str), d["importance_mean"].astype(float))
+        plt.title("Global importance (RAW permutation) — random_forest")
+        plt.xlabel("Mean decrease in ROC-AUC (higher = more important)")
+        plt.tight_layout()
+        plt.show()
 
 
-def plot_global_importance_bar(
-    imp: pd.DataFrame,
-    *,
-    title: str = "Global feature importance",
-    max_features: int = 20,
-):
-    """
-    Simple matplotlib bar plot.
-    """
-    import matplotlib.pyplot as plt
+def plot_section17_local_tables(result: Section17XAIResult):
+    print("\n=== Hard errors picked on best model (random_forest) ===")
+    print(result.hard_errors)
 
-    df = imp.copy()
-    df = df.head(int(max_features))
+    for _, row in result.hard_errors.iterrows():
+        ix = int(row["row_ix"])
+        print(f"\n--- Case row_ix={ix} | y_true={int(row['y_true'])} | y_pred={int(row['y_pred'])} | score={float(row['score']):.4f} ---")
 
-    plt.figure()
-    plt.barh(df["feature"][::-1], df["importance_mean"][::-1])
-    plt.xlabel("Importance (mean)")
-    plt.title(title)
-    plt.tight_layout()
-    plt.show()
+        print("\n[Local — Logistic Regression exact contributions (encoded space)]")
+        print(result.local_logreg_exact.get(ix, pd.DataFrame()).head(20))
 
-
-def plot_local_contributions_bar(
-    contrib: pd.DataFrame,
-    *,
-    title: str = "Local linear contributions (top features)",
-):
-    """
-    Simple matplotlib bar plot for linear local explanations.
-    """
-    import matplotlib.pyplot as plt
-
-    df = contrib.copy()
-    plt.figure()
-    plt.barh(df["feature"][::-1], df["contribution"][::-1])
-    plt.xlabel("Contribution (value × coef)")
-    plt.title(title)
-    plt.tight_layout()
-    plt.show()
+        print("\n[Local — Random Forest counterfactual deltas (raw space)]")
+        print(result.local_best_counterfactual.get(ix, pd.DataFrame()).head(20))
