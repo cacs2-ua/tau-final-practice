@@ -5551,3 +5551,569 @@ def run_section15_wilcoxon_best_two(
         strict_same_folds=strict_same_folds,
     )
 
+
+---- SECTION 16 ----
+%%writefile section16_error_analysis.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+from sklearn.base import clone
+from sklearn.metrics import confusion_matrix, roc_auc_score
+
+# -------------------------
+# Missingness (consistent with your earlier sections)
+# -------------------------
+MISSING_TOKENS = ("", "?", "NA", "N/A", "NULL", "NAN", "UNKNOWN", "UNKNOWN/INVALID")
+
+def is_missing(v: object, missing_tokens: Sequence[str] = MISSING_TOKENS) -> bool:
+    if v is None:
+        return True
+    try:
+        if pd.isna(v):
+            return True
+    except Exception:
+        pass
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "":
+            return True
+        return s.upper() in {t.upper() for t in missing_tokens}
+    return False
+
+
+def _safe_index(X, idx: np.ndarray):
+    if isinstance(X, (pd.DataFrame, pd.Series)):
+        return X.iloc[idx]
+    return X[idx]
+
+
+def get_score_vector(estimator, X, *, positive_label: int = 1) -> np.ndarray:
+    """
+    Continuous scores for AUC and confidence:
+    - predict_proba[:, pos] if available
+    - else decision_function
+    """
+    if hasattr(estimator, "predict_proba"):
+        proba = np.asarray(estimator.predict_proba(X))
+        if proba.ndim != 2 or proba.shape[1] < 2:
+            raise ValueError("predict_proba must return [n_samples, 2+] for binary tasks.")
+        classes = getattr(estimator, "classes_", None)
+        if classes is None:
+            pos_idx = 1
+        else:
+            classes = np.asarray(classes)
+            pos_idx = int(np.where(classes == positive_label)[0][0]) if positive_label in set(classes.tolist()) else 1
+        return proba[:, pos_idx].astype(float)
+
+    if hasattr(estimator, "decision_function"):
+        s = estimator.decision_function(X)
+        return np.asarray(s, dtype=float).ravel()
+
+    raise ValueError("Estimator must provide predict_proba or decision_function.")
+
+
+def confidence_from_scores(scores: np.ndarray) -> np.ndarray:
+    """
+    Model-agnostic confidence proxy:
+    - if scores look like probabilities in [0,1], use |p-0.5|
+    - else use |z| after standardization
+    """
+    s = np.asarray(scores, dtype=float).ravel()
+    if np.all(s >= 0.0) and np.all(s <= 1.0):
+        return np.abs(s - 0.5)
+    mu = float(np.nanmean(s))
+    sd = float(np.nanstd(s) + 1e-12)
+    z = (s - mu) / sd
+    return np.abs(z)
+
+
+def row_missingness_counts(df: pd.DataFrame, feature_cols: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
+    miss = df[feature_cols].applymap(is_missing)
+    miss_count = miss.sum(axis=1).to_numpy(dtype=int)
+    miss_rate = (miss_count / float(len(feature_cols))).astype(float)
+    return miss_count, miss_rate
+
+
+@dataclass(frozen=True)
+class OOFResult:
+    oof_pred: np.ndarray
+    oof_score: np.ndarray
+    auc: float
+    cm: np.ndarray
+
+
+def compute_oof_for_model(
+    pipeline,
+    X,
+    y: np.ndarray,
+    *,
+    cv_splits: Sequence[Tuple[np.ndarray, np.ndarray]],
+    positive_label: int = 1,
+) -> OOFResult:
+    """
+    Manual CV (no leakage): fit on TRAIN fold, predict on TEST fold.
+    Produces OOF predictions and OOF scores for every sample.
+    """
+    y = np.asarray(y, dtype=int).ravel()
+    n = len(y)
+
+    oof_pred = np.full(n, -1, dtype=int)
+    oof_score = np.full(n, np.nan, dtype=float)
+
+    for tr, te in cv_splits:
+        tr = np.asarray(tr, dtype=np.int64)
+        te = np.asarray(te, dtype=np.int64)
+
+        model = clone(pipeline)
+        model.fit(_safe_index(X, tr), y[tr])
+
+        yhat = np.asarray(model.predict(_safe_index(X, te)), dtype=int)
+        scr = get_score_vector(model, _safe_index(X, te), positive_label=positive_label)
+
+        oof_pred[te] = yhat
+        oof_score[te] = np.asarray(scr, dtype=float)
+
+    if np.any(oof_pred < 0) or np.any(np.isnan(oof_score)):
+        raise RuntimeError("OOF predictions/scores incomplete. Check your cv_splits coverage.")
+
+    auc = float(roc_auc_score(y, oof_score))
+    cm = confusion_matrix(y, oof_pred, labels=[0, 1])
+    return OOFResult(oof_pred=oof_pred, oof_score=oof_score, auc=auc, cm=cm)
+
+
+def select_systematic_failures(
+    y: np.ndarray,
+    *,
+    best_model: str,
+    oof_by_model: Dict[str, OOFResult],
+    candidate_models: Sequence[str],
+    k: int = 3,
+    min_models: int = 2,
+) -> List[int]:
+    """
+    "Systematic failure" = misclassified by best model AND misclassified by >= min_models-1 other models
+    among candidate_models (top models).
+    """
+    y = np.asarray(y, dtype=int).ravel()
+
+    best = oof_by_model[best_model]
+    mis_best = (best.oof_pred != y)
+
+    # consensus count among candidate models
+    mis_counts = np.zeros_like(y, dtype=int)
+    for m in candidate_models:
+        r = oof_by_model[m]
+        mis_counts += (r.oof_pred != y).astype(int)
+
+    # need best model wrong AND consensus threshold
+    keep = np.where(mis_best & (mis_counts >= int(min_models)))[0]
+
+    if keep.size == 0:
+        # relax: at least best model wrong (fallback)
+        keep = np.where(mis_best)[0]
+
+    # prioritize "high-confidence wrong" in best model
+    conf = confidence_from_scores(best.oof_score)
+    order = keep[np.argsort(-conf[keep])]  # descending confidence
+
+    return order[: int(k)].astype(int).tolist()
+
+
+def rare_category_flags(df: pd.DataFrame, idx: int, cols: Sequence[str], min_count: int = 50) -> Dict[str, Tuple[Any, int]]:
+    out: Dict[str, Tuple[Any, int]] = {}
+    for c in cols:
+        if c not in df.columns:
+            continue
+        v = df.loc[idx, c]
+        # bucket missing
+        vv = "__MISSING__" if is_missing(v) else str(v)
+        counts = df[c].astype("object").map(lambda x: "__MISSING__" if is_missing(x) else str(x)).value_counts()
+        out[c] = (vv, int(counts.get(vv, 0)))
+    # filter to only rare ones
+    return {c: (v, n) for c, (v, n) in out.items() if n < min_count}
+
+
+def hypothesize_case(
+    df: pd.DataFrame,
+    idx: int,
+    *,
+    feature_cols: Sequence[str],
+    rare_cols: Sequence[str],
+    rare_min_count: int = 50,
+) -> List[str]:
+    reasons: List[str] = []
+
+    miss_count, miss_rate = row_missingness_counts(df.loc[[idx]], feature_cols)
+    miss_count = int(miss_count[0])
+    miss_rate = float(miss_rate[0])
+    if miss_rate >= 0.30:
+        reasons.append(f"High missingness: {miss_count}/{len(feature_cols)} features missing ({miss_rate:.1%}).")
+
+    rares = rare_category_flags(df, idx, rare_cols, min_count=rare_min_count)
+    if rares:
+        msg = "Rare categories: " + ", ".join([f"{c}={v} (count={n})" for c, (v, n) in rares.items()])
+        reasons.append(msg)
+
+    # simple clinically-inspired checks if engineered features exist
+    if "a1c_high" in df.columns and "insulin_active" in df.columns:
+        a1c_high = int(pd.to_numeric(df.loc[idx, "a1c_high"], errors="coerce") or 0)
+        ins_act = int(pd.to_numeric(df.loc[idx, "insulin_active"], errors="coerce") or 0)
+        if a1c_high == 1 and ins_act == 0:
+            reasons.append("Possible lab/therapy mismatch: A1C high but insulin not active (could confuse model).")
+
+    if "total_visits" in df.columns and "time_in_hospital" in df.columns:
+        tv = float(pd.to_numeric(df.loc[idx, "total_visits"], errors="coerce") or 0.0)
+        tih = float(pd.to_numeric(df.loc[idx, "time_in_hospital"], errors="coerce") or 0.0)
+        if tv >= 5 and tih <= 3:
+            reasons.append("Utilization pattern: high prior visits but short stay (non-typical combination).")
+
+    if "n_changed_diabetes_meds" in df.columns:
+        nch = float(pd.to_numeric(df.loc[idx, "n_changed_diabetes_meds"], errors="coerce") or 0.0)
+        if nch >= 2:
+            reasons.append("Multiple medication changes (complex management) may increase uncertainty.")
+
+    return reasons
+
+
+# -------------------------
+# Plotting helpers (matplotlib, no seaborn required)
+# -------------------------
+def plot_confusion_matrix(cm: np.ndarray, *, title: str = "Confusion matrix (OOF)") -> None:
+    import matplotlib.pyplot as plt
+
+    cm = np.asarray(cm, dtype=int)
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    im = ax.imshow(cm)
+    ax.set_title(title)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_xticks([0, 1])
+    ax.set_yticks([0, 1])
+    ax.set_xticklabels(["0", "1"])
+    ax.set_yticklabels(["0", "1"])
+
+    for (i, j), v in np.ndenumerate(cm):
+        ax.text(j, i, str(v), ha="center", va="center")
+
+    fig.colorbar(im, ax=ax)
+    plt.show()
+
+
+def plot_fp_fn_by_fold(
+    y: np.ndarray,
+    oof_pred: np.ndarray,
+    cv_splits: Sequence[Tuple[np.ndarray, np.ndarray]],
+    *,
+    title: str = "False Positives / False Negatives by fold",
+) -> None:
+    import matplotlib.pyplot as plt
+
+    y = np.asarray(y, dtype=int).ravel()
+    oof_pred = np.asarray(oof_pred, dtype=int).ravel()
+
+    fps, fns = [], []
+    for _, te in cv_splits:
+        te = np.asarray(te, dtype=np.int64)
+        yt = y[te]
+        yp = oof_pred[te]
+        fp = int(((yt == 0) & (yp == 1)).sum())
+        fn = int(((yt == 1) & (yp == 0)).sum())
+        fps.append(fp)
+        fns.append(fn)
+
+    x = np.arange(len(fps))
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.bar(x, fps, label="FP")
+    ax.bar(x, fns, bottom=fps, label="FN")
+    ax.set_title(title)
+    ax.set_xlabel("Fold")
+    ax.set_ylabel("Count")
+    ax.legend()
+    plt.show()
+
+
+def plot_missingness_distributions(
+    df: pd.DataFrame,
+    y: np.ndarray,
+    oof_pred: np.ndarray,
+    *,
+    feature_cols: Sequence[str],
+    title: str = "Row missingness: correct vs misclassified",
+) -> None:
+    import matplotlib.pyplot as plt
+
+    y = np.asarray(y, dtype=int).ravel()
+    oof_pred = np.asarray(oof_pred, dtype=int).ravel()
+    mis = (oof_pred != y)
+
+    miss_count, miss_rate = row_missingness_counts(df, feature_cols)
+
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.hist(miss_rate[~mis], bins=30, alpha=0.7, label="Correct")
+    ax.hist(miss_rate[mis], bins=30, alpha=0.7, label="Misclassified")
+    ax.set_title(title)
+    ax.set_xlabel("Missing-rate per row")
+    ax.set_ylabel("Frequency")
+    ax.legend()
+    plt.show()
+
+
+def plot_case_profile(
+    df: pd.DataFrame,
+    idx: int,
+    *,
+    numeric_cols: Sequence[str],
+    title: Optional[str] = None,
+) -> None:
+    """
+    Compare case numeric features vs dataset medians (overall + by class if available).
+    """
+    import matplotlib.pyplot as plt
+
+    present = [c for c in numeric_cols if c in df.columns]
+    if not present:
+        return
+
+    vals = []
+    meds = []
+    for c in present:
+        v = pd.to_numeric(df.loc[idx, c], errors="coerce")
+        vals.append(float(v) if not pd.isna(v) else np.nan)
+        meds.append(float(pd.to_numeric(df[c], errors="coerce").median(skipna=True)))
+
+    x = np.arange(len(present))
+    fig = plt.figure(figsize=(max(8, len(present) * 0.6), 4))
+    ax = fig.add_subplot(111)
+    ax.bar(x - 0.2, vals, width=0.4, label="Case")
+    ax.bar(x + 0.2, meds, width=0.4, label="Dataset median")
+    ax.set_xticks(x)
+    ax.set_xticklabels(present, rotation=45, ha="right")
+    ax.set_ylabel("Value")
+    ax.set_title(title or f"Case profile idx={idx}")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+import os, sys, importlib.util
+import numpy as np
+import pandas as pd
+
+import section5_preprocessing_pipeline as s5
+import section7_validation_protocol as s7
+import section9_expanded_modeling as s9
+import section11_feature_engineering as s11
+import section16_error_analysis as s16
+
+# -----------------------------
+# 1) Robust import of your local code.py as "project_code"
+# -----------------------------
+def import_module_from_path(module_name: str, file_path: str):
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load spec for {module_name} from {file_path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules.pop(module_name, None)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+PROJECT_DIR = os.getcwd()
+project_code = import_module_from_path("project_code", os.path.join(PROJECT_DIR, "code.py"))
+
+# -----------------------------
+# 2) Load REAL data
+# -----------------------------
+DATA_PATH = os.path.join(PROJECT_DIR, "database", "diabetic_data.csv")
+df_raw = pd.read_csv(DATA_PATH, low_memory=False)
+print("Loaded df_raw:", df_raw.shape)
+
+# -----------------------------
+# 3) Engineer targets (binary + optional multiclass)
+# -----------------------------
+df = project_code.engineer_targets(
+    df_raw,
+    source_col="readmitted",
+    binary_col="readmitted_30d",
+    multiclass_col="readmitted_3class",
+    add_multiclass=True,
+    drop_source=False,
+    unknown_policy="error",
+)
+
+# -----------------------------
+# 4) Apply Section 11 feature engineering (recommended for better interpretability)
+# -----------------------------
+fe_out = s11.apply_feature_engineering(df)
+df_model = fe_out.df
+print("Section 11 added columns:", len(fe_out.added_columns))
+
+# -----------------------------
+# 5) Preprocessing config (same spirit as your earlier sections)
+# -----------------------------
+cfg = s5.DiabetesPreprocessConfig(
+    onehot_sparse=True,
+    rare_min_count=50,
+    scale_numeric=True,
+    scaler="standard",
+)
+
+# -----------------------------
+# 6) Fixed 10-fold splits (MUST be reused)
+# -----------------------------
+y = df_model["readmitted_30d"].astype(int).to_numpy()
+splits = s7.make_stratified_cv_splits(y, n_splits=10, shuffle=True, random_state=42)
+print("CV fingerprint:", s7.cv_splits_fingerprint(splits))
+
+# -----------------------------
+# 7) Pick "best model" from Section 9 candidate suite (by mean ROC-AUC)
+#    (We run once WITHOUT OOF to decide the top models, then compute OOF only for top-3)
+# -----------------------------
+suite = s9.run_section9_expanded_suite(
+    df_model,
+    target_col="readmitted_30d",
+    preprocess_config_base=cfg,
+    cv_splits=splits,
+    n_splits=10,
+    return_oof=False,
+    fast_mode=False,          # set True if you just want a quick pass
+    svd_components=100,
+)
+
+summary = suite.summary_table.sort_values("roc_auc_mean", ascending=False).reset_index(drop=True)
+display(summary)
+
+best_model_name = str(summary.loc[0, "model"])
+top_models = summary.head(3)["model"].astype(str).tolist()
+print("Best model:", best_model_name)
+print("Top-3 models:", top_models)
+
+# Build pipelines for those models (same constructor used in Section 9)
+specs = s9.build_section9_model_specs(
+    df_model,
+    preprocess_config_base=cfg,
+    model_random_state=42,
+    svd_components=100,
+    fast_mode=False,
+)
+pipelines = {sp.name: sp.pipeline for sp in specs}
+
+# Feature matrix X = drop target cols
+drop_cols = [c for c in cfg.target_cols if c in df_model.columns]
+X = df_model.drop(columns=drop_cols, errors="ignore")
+
+# -----------------------------
+# 8) Compute OOF predictions/scores for top models (systematic failures)
+# -----------------------------
+oof_by_model = {}
+for m in top_models:
+    print(f"OOF for model: {m}")
+    oof_by_model[m] = s16.compute_oof_for_model(
+        pipelines[m],
+        X,
+        y,
+        cv_splits=splits,
+        positive_label=1,
+    )
+    print("  OOF AUC:", oof_by_model[m].auc)
+
+best_oof = oof_by_model[best_model_name]
+
+# -----------------------------
+# 9) Visualizations required by rubric
+# -----------------------------
+s16.plot_confusion_matrix(best_oof.cm, title=f"OOF confusion matrix — best model = {best_model_name}")
+s16.plot_fp_fn_by_fold(y, best_oof.oof_pred, splits, title=f"FP/FN by fold — best model = {best_model_name}")
+
+feature_cols = [c for c in df_model.columns if c not in cfg.target_cols]
+s16.plot_missingness_distributions(
+    df_model,
+    y,
+    best_oof.oof_pred,
+    feature_cols=feature_cols,
+    title="Row missingness distribution: correct vs misclassified (best model)",
+)
+
+# -----------------------------
+# 10) Identify ≥3 systematic failures
+#     Definition here:
+#       - misclassified by best model
+#       - AND misclassified by >= 1 of the other top models (min_models=2)
+#       - prioritize high-confidence wrong predictions
+# -----------------------------
+case_indices = s16.select_systematic_failures(
+    y,
+    best_model=best_model_name,
+    oof_by_model=oof_by_model,
+    candidate_models=top_models,
+    k=3,
+    min_models=2,
+)
+print("Selected systematic failure indices:", case_indices)
+
+# -----------------------------
+# 11) Case-level inspection + auto-hypotheses + per-case plots
+# -----------------------------
+KEY_NUMERIC = [
+    "age_mid", "time_in_hospital", "num_medications", "number_diagnoses",
+    "total_visits", "stay_x_meds", "stay_x_diagnoses",
+    "n_active_diabetes_meds", "n_changed_diabetes_meds"
+]
+RARE_COLS = [
+    "race", "gender", "payer_code", "medical_specialty",
+    "diag_1_group", "diag_2_group", "diag_3_group",
+    "admission_type", "discharge_disposition", "admission_source"
+]
+
+for idx in case_indices:
+    true_y = int(y[idx])
+    pred_y = int(best_oof.oof_pred[idx])
+    score = float(best_oof.oof_score[idx])
+    err_type = "FN" if (true_y == 1 and pred_y == 0) else ("FP" if (true_y == 0 and pred_y == 1) else "OK")
+
+    print("\n" + "="*90)
+    print(f"CASE idx={idx} | true={true_y} pred={pred_y} | error={err_type} | score={score:.4f}")
+    print("- Key fields snapshot:")
+    cols_preview = [
+        "encounter_id", "patient_nbr", "readmitted", "readmitted_30d",
+        "age", "age_mid", "elderly",
+        "diag_1", "diag_1_group", "n_diabetes_diags", "primary_diag_is_diabetes",
+        "A1Cresult", "a1c_measured", "a1c_high",
+        "max_glu_serum", "glu_measured", "glu_high",
+        "insulin", "insulin_active", "insulin_changed",
+        "time_in_hospital", "num_medications", "polypharmacy",
+        "number_outpatient", "number_emergency", "number_inpatient",
+        "total_visits", "any_emergency", "any_inpatient",
+        "n_active_diabetes_meds", "n_changed_diabetes_meds",
+    ]
+    cols_preview = [c for c in cols_preview if c in df_model.columns]
+    display(df_model.loc[[idx], cols_preview])
+
+    reasons = s16.hypothesize_case(
+        df_model,
+        idx,
+        feature_cols=feature_cols,
+        rare_cols=RARE_COLS,
+        rare_min_count=50,
+    )
+    print("- Hypotheses for failure:")
+    if reasons:
+        for r in reasons:
+            print("  •", r)
+    else:
+        print("  • (No strong heuristic flags; likely boundary/noisy case or label ambiguity.)")
+
+    s16.plot_case_profile(
+        df_model,
+        idx,
+        numeric_cols=KEY_NUMERIC,
+        title=f"Case numeric profile vs dataset median (idx={idx}, error={err_type})"
+    )
