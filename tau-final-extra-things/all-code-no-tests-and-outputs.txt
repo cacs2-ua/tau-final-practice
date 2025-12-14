@@ -334,6 +334,40 @@ df = project_code.engineer_targets(
 # Quick sanity check
 df[["readmitted", "readmitted_30d", "readmitted_3class"]].head(), df["readmitted"].value_counts()
 
+# 2.1 Apply ID -> description mappings (recommended for interpretability)
+df = df_raw.copy()
+
+def apply_mapping(df: pd.DataFrame, id_col: str, new_col: str) -> pd.DataFrame:
+    if id_col not in df.columns or id_col not in id_maps:
+        return df
+    map_df = id_maps[id_col]
+    mapper = map_df.set_index(id_col)["description"]
+    mapper.index = mapper.index.astype("string")
+
+    keys = df[id_col].astype("string").str.strip()
+    df[new_col] = keys.map(mapper)  # unknown stays <NA>
+    return df
+
+df = apply_mapping(df, "admission_type_id", "admission_type")
+df = apply_mapping(df, "discharge_disposition_id", "discharge_disposition")
+df = apply_mapping(df, "admission_source_id", "admission_source")
+
+# Optionally drop the numeric ID columns to avoid duplicated information:
+df = df.drop(columns=[c for c in ["admission_type_id", "discharge_disposition_id", "admission_source_id"] if c in df.columns])
+
+# 2.2 Engineer targets (binary + optional multiclass)
+df = project_code.engineer_targets(
+    df,
+    source_col="readmitted",
+    binary_col="readmitted_30d",
+    multiclass_col="readmitted_3class",
+    add_multiclass=True,
+    drop_source=False,
+    unknown_policy="error",  # fail fast if something unexpected appears
+)
+
+# Quick sanity check
+df[["readmitted", "readmitted_30d", "readmitted_3class"]].head(), df["readmitted"].value_counts()
 
 
 ---- SECTION 3 ----
@@ -885,6 +919,16 @@ rep = s3.profile_dataset(df)
 # Display key tables
 rep.data_dictionary.head(20), rep.missing_summary.head(20)
 rep.leakage_risks, rep.quality_risks.head(30)
+
+import section3_dataset_understanding as s3
+
+# Build the report object (tables you can directly use in the PDF report)
+rep = s3.profile_dataset(df)
+
+# Display key tables
+rep.data_dictionary.head(20), rep.missing_summary.head(20)
+rep.leakage_risks, rep.quality_risks.head(30)
+
 
 
 ---- SECTION 4 ----
